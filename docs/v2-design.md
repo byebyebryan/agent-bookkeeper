@@ -7,8 +7,9 @@ proof before compatibility is promised.
 
 V2 replaces direct client writes to an operator-managed mirror with an
 authenticated archive service and asynchronous local client. The service owns
-accepted revisions, durable raw bytes, commits, and the consumer-facing raw
-projection. V1.5 identity, ledger, event, delivery, and consumer behavior remain
+accepted revisions, durable raw objects and receipts, commits, and verified
+payload access. Its ordinary-file current projection is rebuildable derived
+state. V1.5 identity, ledger, event, delivery, and consumer behavior remain
 unchanged.
 
 ```text
@@ -26,7 +27,7 @@ local Bookkeeper client -> durable local queue -> scan/hash/chunk worker
                                                     |
                          +--------------------------+------------------+
                          v                                             v
-              canonical objects/receipts                  ordinary raw projection
+              canonical objects/receipts               rebuildable current projection
                          |                                             |
                          +------------------> V1.5 ledger/events ------+
                                                     |
@@ -39,7 +40,8 @@ local Bookkeeper client -> durable local queue -> scan/hash/chunk worker
 - A local durable client queue and acknowledged source state.
 - Incremental, idempotent byte upload over an API.
 - Service-owned canonical raw object storage and commit receipts.
-- Atomic materialization of ordinary consumer-facing session files.
+- Verified streaming and bounded on-demand materialization for consumers.
+- A rebuildable asynchronous current-file projection for compatibility/export.
 - Native client-declared generations and source-to-archive lag status.
 
 V2 does not replace record identity, revision semantics, archive events,
@@ -66,6 +68,7 @@ files or waits for the network.
 Client state uses a local durable database or equivalent journal containing:
 
 - stable `producer_id` and client instance identity;
+- current random `client_epoch` and its server-authorized predecessor receipt;
 - configured provider roots and layout plugins;
 - pending scan triggers and last completed scan;
 - observed cheap fingerprints and accepted local revisions;
@@ -73,6 +76,12 @@ Client state uses a local durable database or equivalent journal containing:
 - monotonically increasing client generation IDs;
 - commit receipts and last server acknowledgement;
 - retry/backoff and last error state.
+
+Credential rotation does not change the producer or client epoch. If local state
+is lost, an administrator-authorized recovery enrolls a new client epoch chained
+to the server's latest producer receipt; it never guesses a generation number in
+the lost epoch. The lifecycle is normative in
+[domain-contract.md](domain-contract.md).
 
 Every later trigger first resumes pending work. A permanent daemon or periodic
 timer is optional; eventual retry on a later lifecycle event remains supported.
@@ -85,7 +94,7 @@ The initial protocol uses bounded, content-addressed fixed-size chunks rather
 than introducing tus, librsync, or content-defined chunking as required
 dependencies.
 
-The initial profile is versioned as a protocol input, for example:
+The initial proof profile is a concrete versioned protocol input:
 
 ```text
 chunking: fixed-v1
@@ -99,6 +108,12 @@ partial tail chunk plus newly added chunks. Mid-file insertion can shift and
 re-upload the following fixed chunks; that is acceptable for the first proof
 because agent transcripts are expected to be append-dominant and rewrites are
 handled correctly even when less efficiently.
+
+Fixed chunks reduce network transfer, not necessarily client read cost. The
+initial correctness path streams every admitted changed record completely to
+compute canonical BLAKE3-256 and its chunk manifest. Quiescence, minimum revision
+intervals, byte budgets, and controlled maintenance windows coalesce active
+large files. No append-only shortcut is assumed in the first protocol.
 
 The digest algorithm and chunking profile are explicit in every manifest. They
 must never be changed in place under an existing profile name.
@@ -118,14 +133,15 @@ overlapping transfer state machines at once.
 
 ## Archive storage layout
 
-A filesystem backend has four logical areas:
+A filesystem backend has six logical areas:
 
 ```text
 archive-root/
   objects/       # immutable producer-scoped content-addressed raw-byte chunks
   receipts/      # immutable accepted revision and generation receipts
-  staging/       # incomplete uploads and materialization work
-  projection/    # immutable revision files plus a current convenience view
+  staging/       # incomplete uploads and receipt-publication work
+  cache/         # bounded leased materializations for path-only consumers
+  projection/    # rebuildable current convenience/export view
   state/         # online catalog, delivery queues, migrations, and locks
 ```
 
@@ -136,11 +152,14 @@ Recovery classes are:
 | Objects and committed receipts | Canonical archive; durable and backed up together. |
 | Online catalog/event index | Durable online state, rebuildable from committed receipts plus migrations. |
 | Projection | Rebuildable from objects and receipts. |
+| Materialization cache | Bounded derived state; removable when unleased. |
 | Incomplete staging | Disposable after a conservative expiry and reconciliation. |
-| Consumer delivery state | Durable operational state, replayable from the archive event ledger. |
+| Consumer delivery state | Durable operational state; backed up for exact restore, or explicitly rebuilt as a new subscription. |
 
-Consumers never read `objects` or `staging` directly. They resolve committed
-revisions through Bookkeeper or consume a read-only `projection` mount.
+Consumers never infer eligibility by scanning `objects`, `staging`, cache, or
+projection. They receive a committed `RevisionReader`; stream consumers read
+ordered chunks directly, while path-only consumers receive a leased verified
+cache entry. The read-only current projection is compatibility/export state.
 
 Initial object presence is logically producer-scoped even when a backend can
 deduplicate physical bytes. A client must not learn whether another producer
@@ -153,6 +172,7 @@ A revision manifest contains:
 
 - protocol and chunking profile versions;
 - producer, agent namespace, and stable session identity;
+- record kind and record key;
 - logical root role and source-relative location;
 - whole-revision digest and byte length;
 - ordered chunk digest/length pairs;
@@ -161,15 +181,28 @@ A revision manifest contains:
 
 A generation manifest contains:
 
-- producer and client generation ID;
+- producer, client epoch, and client generation ID;
 - previous accepted generation receipt, if any;
 - the complete set of revision/location changes and tombstones in the client
   transaction;
 - a digest of the canonical manifest representation.
 
-The tuple `(producer_id, client_generation_id)` is unique. Repeating it with the
-same manifest is an idempotent retry; repeating it with different content is a
-conflict and never overwrites the original request.
+The tuple `(producer_id, client_epoch, client_generation_id)` is unique.
+Repeating it with the same manifest is an idempotent retry; repeating it with
+different content is a conflict and never overwrites the original request.
+
+The immutable commit receipt contains enough accepted server state to rebuild
+the catalog without trusting a surviving online database:
+
+- receipt format version and the complete accepted generation manifest;
+- request key, predecessor receipt digest, and generation-manifest digest;
+- server-assigned archive sequence and `committed_at`;
+- emitted event IDs/sequences, assigned record versions, and transitions;
+- receipt digest over a canonical representation that excludes the digest field
+  itself.
+
+Manifest and receipt sizes are bounded. Golden fixtures pin their deterministic
+serialization before the protocol is declared stable.
 
 ## Conceptual API
 
@@ -195,53 +228,53 @@ any mismatch is corruption and blocks commit.
 ## Commit state machine
 
 ```text
-proposed -> uploading -> ready -> materializing -> committed
-    |           |          |            |
-    +-----------+----------+------------+--> failed/retryable
+proposed -> uploading -> ready -> verifying -> publishing -> committed
+    |           |          |          |             |
+    +-----------+----------+----------+-------------+--> failed/retryable
 ```
 
 The commit procedure is:
 
 1. Confirm every referenced object exists with the declared digest and length.
-2. Write immutable revision manifests into staging.
-3. Stream each changed record from ordered objects into a temporary immutable
-   revision file, verify its whole-revision digest and length, then fsync it.
-4. Prepare the generation and archive events in the catalog without making
-   them consumer-visible.
-5. Atomically rename each immutable revision file, then publish the canonical
-   generation receipt last as the commit point.
-6. Mark the generation committed and append its V1.5 archive events in one
-   catalog transaction.
-7. Return the receipt, make eligible consumer deliveries visible, and update
-   the non-authoritative current-path convenience view.
+2. Stream ordered objects for each new revision through BLAKE3-256 and verify
+   the declared whole-record digest and byte length. No full-file copy is kept.
+3. Under the exclusive archive commit mutex, validate predecessor state,
+   allocate archive/event sequences, and durably record `preparing` state.
+4. Write, `fsync`, atomically rename, and parent-directory `fsync` the immutable
+   canonical receipt. Receipt rename is the archive commit point.
+5. Finalize catalog events and eligible delivery rows in one transaction.
+6. Return the receipt. Refresh of the non-authoritative current projection is
+   asynchronous.
 
-The published receipt is the durable recovery marker. If the service crashes
-between receipt publication and the final catalog transaction, startup
-reconciliation imports the receipt and completes the index. Consumers resolve
-only immutable revision locators from committed ledger events; temporary files,
-uncommitted revision files, and a partially refreshed current convenience view
-are never eligibility signals.
+Startup reconciles receipts before becoming ready. A receipt with missing or
+preparing catalog state is idempotently imported; catalog-committed state with a
+missing or invalid receipt fails readiness. The complete serialization, `fsync`,
+sequence, and crash matrix is normative in
+[durability-contract.md](durability-contract.md).
 
 One committed generation may contain many records, but implementation limits
 its manifest bytes, record count, and total newly referenced bytes so commits
 remain bounded.
 
-## Raw projection
+## Payload access and current projection
 
-The projection contains immutable byte-exact revision files for delivery plus a
-current ordinary-file view for inspection, export, and compatibility. Its paths
-are derived from validated producer, agent, logical root, and provider-safe
-location fields. Client strings are never concatenated directly into filesystem
-paths.
+A V2 revision resolves to `availability=retained_chunks`. `RevisionReader`
+streams its committed chunk manifest and validates both object and whole-record
+digests. A path-only consumer receives a lease-scoped full-file materialization
+from a bounded derived cache; Bookkeeper does not permanently reconstruct every
+historical revision.
 
-A location move updates the current convenience view without changing record
-identity. A revision event always resolves to its immutable committed revision
-file. A tombstone removes the current view according to the selected retention
-policy while committed canonical receipts, revision files, and objects follow
-that policy's separate lifecycle.
+The current projection contains only the latest ordinary-file view for
+inspection, export, and compatibility. It is refreshed after commit, may lag the
+ledger, and is rebuilt from objects and receipts. A location move updates this
+view without changing identity; a tombstone removes the current view according
+to policy. Recursive scanning of the projection is never the preferred or
+authoritative consumer protocol.
 
-The archive ledger is the authority for eligibility. Recursive scanning of the
-projection is a compatibility adapter, not the preferred consumer protocol.
+Projection paths are derived from validated producer, agent, logical root, and
+provider-safe location fields. Client strings are never concatenated directly
+into filesystem paths. See
+[payload-delivery-contract.md](payload-delivery-contract.md).
 
 ## Authentication and authorization
 
@@ -260,10 +293,16 @@ LAN placement may reduce exposure but does not replace the producer identity or
 scope checks. TLS termination and credential mechanism remain deployment
 choices until the API proof selects a reference setup.
 
+Producer identity is random and stable; credential rotation and client-epoch
+recovery follow [domain-contract.md](domain-contract.md). Client-supplied clocks
+are provenance only and never determine generation order.
+
 ## Retry, offline, and conflict behavior
 
 - Offline clients retain scan/upload/commit state locally and retry on a later
   trigger.
+- Client-state loss requires an administrator-authorized new epoch chained to
+  the latest receipt; it cannot reuse an unknown prior sequence.
 - A server restart preserves uploaded objects and proposed generations, then
   reconciles their state.
 - Duplicate object uploads and generation commits are idempotent.
@@ -289,11 +328,14 @@ staging manifest references an object.
 Migration does not send an existing archive back through a workstation:
 
 1. V1.5 reconciles the mirror and freezes a selected stable catalog cohort.
-2. A server-side seed tool streams those exact revisions through the selected
+2. Bookkeeper exports a versioned migration-epoch bundle containing the V1.5
+   event ledger/current state and historical payload-availability metadata.
+3. A server-side seed tool streams current available revisions through the selected
    chunk profile into the V2 object store.
-3. It verifies reconstructed whole-revision digests and writes imported commit
+4. It verifies canonical whole-revision digests and writes imported commit
    receipts linked to existing V1.5 records.
-4. Projection and event-ledger equivalence are checked before any transport
+5. A catalog rebuild from the migration epoch plus receipts, current projection,
+   and consumer event equivalence are checked before any transport
    cutover.
 
 The filesystem source adapter remains a supported import, recovery, and audit
@@ -322,12 +364,14 @@ accept live commits from both authorities without an explicit migration mode.
 
 1. Bounded chunk upload and idempotent object storage.
 2. Multi-gigabyte seed and byte-exact reconstruction.
-3. Tail append, truncation, rewrite, interrupted upload, and lost response.
+3. Full-scan resource measurement plus tail-network append, truncation, rewrite,
+   interrupted upload, and lost response.
 4. Commit crash recovery at every state transition.
 5. Location move and tombstone behavior.
 6. Server-side seed from the V1.5 filesystem adapter.
-7. Consumer equivalence against the same archive event stream.
-8. One-producer cutover and rollback drill.
+7. Catalog reconstruction from the migration epoch and receipts.
+8. Streaming and path-only consumer equivalence against the same event stream.
+9. One-producer cutover and rollback drill.
 
 The full gates are in [proof-plan.md](proof-plan.md).
 

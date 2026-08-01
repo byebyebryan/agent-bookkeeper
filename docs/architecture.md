@@ -51,10 +51,12 @@ interpret those bytes. In V1.5 the operator-provided mirror is the canonical
 current-byte source and Bookkeeper adds a durable observation ledger. In V2,
 Bookkeeper's committed objects and receipts are canonical together.
 
-Raw projections, scan fingerprints, catalog indexes, queued jobs, retrieval
-indexes, and learned memories are rebuildable. Consumer cursors and delivery
-state are durable operational state: they may be replayed from the event ledger,
-but should survive ordinary restarts to prevent waste.
+Current projections, materialization caches, scan fingerprints, catalog indexes,
+and downstream retrieval indexes and learned memories are rebuildable. Pending
+client delivery work and consumer cursors/outcomes are durable operational state
+and must survive ordinary restarts. If consumer delivery state is deliberately
+rebuilt from archive events, it uses a new subscription epoch rather than
+pretending to restore prior acknowledgements.
 
 Consumers read only committed archive events and maintain independent delivery
 state. A consumer failure must never block receipt of raw records or corrupt
@@ -62,10 +64,19 @@ another consumer's progress.
 
 ## Stable record model
 
-A record is identified by an immutable producer identity plus an agent namespace and session identifier. A current path is an attribute, not an identity: a file move must not create a new session. A source revision identifies a specific byte representation, normally using a content hash and length. Deletion or retention expiry is represented as an explicit tombstone rather than silently erasing catalog history.
+A record is identified by producer, agent namespace, session, record kind, and
+record key. This supports one primary transcript today and multiple stable
+session records later. A current path is an attribute, not an identity: a file
+move must not create a new session. The canonical byte revision is complete-file
+BLAKE3-256 plus length. Deletion or retention expiry is represented as an
+explicit, monotonic record-version tombstone rather than silently erasing
+catalog history.
 
 See [the V1.5 design](v1.5-design.md) for the detailed domain model and
 [the evolution boundary](evolution-boundary.md) for the parts V2 reuses.
+The normative shared contracts are [domain](domain-contract.md),
+[payload and delivery](payload-delivery-contract.md), and
+[durability and recovery](durability-contract.md).
 
 ## Security and privacy posture
 

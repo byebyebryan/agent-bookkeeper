@@ -32,7 +32,13 @@ V1.5 adds a service-packaged controller that reads the V1 raw mirror without tak
 - delivers each eligible event at least once until each consumer acknowledges it;
 - coalesces work so an archive of many files does not cause a simultaneous full re-ingestion burst.
 
-This layer separates ingestion policy from transport. An evidence archive can ingest a completed session while a learned-memory system advances at a different rate or is disabled entirely. A path move changes location metadata instead of being reclassified as a wholly new record. If derived consumer state becomes unsuitable, it can be reset and replayed from the raw mirror.
+This layer separates ingestion policy from transport. An evidence archive can
+ingest a completed session while a learned-memory system advances at a different
+rate or is disabled entirely. A path move changes location metadata instead of
+being reclassified as a wholly new record. If derived consumer state becomes
+unsuitable, V1.5 can `rebuild_current` from the latest verified mirror bytes.
+Lossless historical byte replay requires retained V2 payloads; V1.5 preserves
+historical metadata but may no longer have old external bytes.
 
 V1.5 is useful even if V2 is later adopted: it establishes the catalog schema, revision protocol, provenance, backpressure controls, and consumer boundary that V2 will use.
 
@@ -46,7 +52,8 @@ V2 turns Bookkeeper into a self-contained archive product. The client remains lo
 ```text
 hook -> local scanner/spool -> incremental transport API -> service staging
                                                     -> committed generation
-                                                    -> canonical raw projection + catalog
+                                                    -> canonical objects/receipts + catalog
+                                                    -> rebuildable current projection
 ```
 
 The client discovers records, calculates the delta from its acknowledged state,
@@ -55,7 +62,16 @@ BLAKE3-addressed chunks. Each bounded chunk is independently idempotent, so tus
 is unnecessary for the first proof; librsync and content-defined chunking remain
 measured future options rather than required protocol dependencies.
 
-The protocol must support a first full seed, append-only updates, rewrite/truncation fallback, and atomic generation commit. Chunking is an implementation detail: the archive must still be able to materialize ordinary, byte-exact session files for debugging, export, and downstream consumers.
+Network updates normally reuse prior chunks, but the first correctness profile
+still reads every admitted changed record completely to detect rewrites and
+calculate its canonical digest. Quiescence, revision-interval, and byte-budget
+policies bound this work.
+
+The protocol must support a first full seed, append-oriented updates,
+rewrite/truncation fallback, and atomic generation commit. Objects plus receipts
+are canonical. Ordinary byte-exact files are streamed or materialized into a
+bounded derived cache on demand; only a rebuildable latest-state projection is
+kept for inspection/export compatibility.
 
 V2 reduces remote filesystem exposure and makes the deployment portable, but it should not be started merely to avoid a small V1 inconvenience. The V1/V1.5 acceptance gates provide the evidence needed to choose it.
 
@@ -67,6 +83,6 @@ component reused from V1.5 and every component V2 adds.
 
 - Retention schedule and deletion propagation policy.
 - Multi-user tenancy and authorization model.
-- Backend choice for canonical raw storage.
+- Additional canonical storage backends beyond the initial durable filesystem.
 - Canonical event envelope and supported agent formats.
 - Whether measured rewrite behavior justifies a content-defined chunk profile.
