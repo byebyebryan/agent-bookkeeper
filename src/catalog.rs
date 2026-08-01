@@ -1,3 +1,4 @@
+use std::fs::Metadata;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6,11 +7,154 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::domain::{
-    ArchiveEvent, CanonicalRevision, DomainError, EventId, EventKind, LogicalLocation, RecordId,
-    RecordIdentity, RecordState, RevisionId,
+    ArchiveEvent, CanonicalRevision, DomainError, EventId, EventKind, LogicalLocation, ProducerId,
+    RecordId, RecordIdentity, RecordState, RevisionId,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// Deployment-scoped provenance for one reconciled filesystem source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceRegistration {
+    source_id: String,
+    producer_id: ProducerId,
+    identity_schema_name: String,
+    identity_schema_version: u32,
+}
+
+impl SourceRegistration {
+    pub fn new(
+        source_id: impl Into<String>,
+        producer_id: ProducerId,
+        identity_schema_name: impl Into<String>,
+        identity_schema_version: u32,
+    ) -> Result<Self, CatalogError> {
+        let source_id = valid_source_field("source_id", source_id.into())?;
+        let identity_schema_name =
+            valid_source_field("identity_schema_name", identity_schema_name.into())?;
+        if identity_schema_version == 0 {
+            return Err(CatalogError::InvalidSourceRegistration(
+                "identity_schema_version must be non-zero".to_owned(),
+            ));
+        }
+        Ok(Self {
+            source_id,
+            producer_id,
+            identity_schema_name,
+            identity_schema_version,
+        })
+    }
+
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    pub fn producer_id(&self) -> ProducerId {
+        self.producer_id
+    }
+
+    pub fn identity_schema_name(&self) -> &str {
+        &self.identity_schema_name
+    }
+
+    pub fn identity_schema_version(&self) -> u32 {
+        self.identity_schema_version
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceScan {
+    source_id: String,
+    generation: u64,
+}
+
+impl SourceScan {
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Cheap metadata used only to decide whether a full hash is required.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceFingerprint {
+    byte_length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: u32,
+    device: Option<u64>,
+    inode: Option<u64>,
+}
+
+impl SourceFingerprint {
+    pub fn from_metadata(metadata: &Metadata) -> std::io::Result<Self> {
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "source candidate is not a regular file",
+            ));
+        }
+        let (modified_seconds, modified_nanoseconds) = unix_time_parts(metadata.modified()?);
+        Ok(Self {
+            byte_length: metadata.len(),
+            modified_seconds,
+            modified_nanoseconds,
+            #[cfg(unix)]
+            device: {
+                use std::os::unix::fs::MetadataExt;
+                Some(metadata.dev())
+            },
+            #[cfg(not(unix))]
+            device: None,
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                Some(metadata.ino())
+            },
+            #[cfg(not(unix))]
+            inode: None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TombstoneGrace {
+    min_complete_scans: u32,
+    min_elapsed_ms: u64,
+}
+
+impl TombstoneGrace {
+    pub fn new(min_complete_scans: u32, min_elapsed_ms: u64) -> Result<Self, CatalogError> {
+        if min_complete_scans == 0 {
+            return Err(CatalogError::InvalidTombstoneGrace(
+                "min_complete_scans must be at least one".to_owned(),
+            ));
+        }
+        Ok(Self {
+            min_complete_scans,
+            min_elapsed_ms,
+        })
+    }
+
+    pub fn min_complete_scans(self) -> u32 {
+        self.min_complete_scans
+    }
+
+    pub fn min_elapsed_ms(self) -> u64 {
+        self.min_elapsed_ms
+    }
+}
+
+impl Default for TombstoneGrace {
+    fn default() -> Self {
+        Self {
+            min_complete_scans: 2,
+            min_elapsed_ms: 0,
+        }
+    }
+}
 
 /// The durable V1.5 catalog. It is intentionally single-process and local-FS
 /// oriented; deployment code is responsible for placing its database only on a
@@ -42,6 +186,14 @@ pub enum CatalogError {
     Corrupt(String),
     #[error("system clock is before the Unix epoch")]
     ClockBeforeEpoch,
+    #[error("invalid source registration: {0}")]
+    InvalidSourceRegistration(String),
+    #[error("source registration conflict: {0}")]
+    SourceRegistrationConflict(String),
+    #[error("invalid tombstone grace: {0}")]
+    InvalidTombstoneGrace(String),
+    #[error("source scan is stale or not active: {0}")]
+    SourceScanConflict(String),
 }
 
 impl Catalog {
@@ -67,6 +219,336 @@ impl Catalog {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    /// Begins a source generation after the filesystem adapter's initial root
+    /// guard has passed. An unfinished generation can never cause tombstones.
+    pub fn begin_source_scan(
+        &mut self,
+        registration: &SourceRegistration,
+    ) -> Result<SourceScan, CatalogError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT producer_id, identity_schema_name, identity_schema_version, next_generation
+                 FROM source_state WHERE source_id = ?1",
+                params![registration.source_id()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let generation =
+            if let Some((producer_id, schema_name, schema_version, next_generation)) = existing {
+                if producer_id != registration.producer_id().as_uuid().as_bytes()
+                    || schema_name != registration.identity_schema_name()
+                    || schema_version != i64::from(registration.identity_schema_version())
+                {
+                    return Err(CatalogError::SourceRegistrationConflict(
+                        registration.source_id().to_owned(),
+                    ));
+                }
+                let generation = as_u64(next_generation, "source scan generation")?
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        CatalogError::Corrupt("source scan generation overflow".to_owned())
+                    })?;
+                transaction.execute(
+                    "UPDATE source_state SET next_generation = ?1 WHERE source_id = ?2",
+                    params![
+                        as_i64(generation, "source scan generation")?,
+                        registration.source_id()
+                    ],
+                )?;
+                generation
+            } else {
+                transaction.execute(
+                    "INSERT INTO source_state (
+                    source_id, producer_id, identity_schema_name, identity_schema_version,
+                    next_generation, last_complete_generation
+                 ) VALUES (?1, ?2, ?3, ?4, 1, 0)",
+                    params![
+                        registration.source_id(),
+                        registration.producer_id().as_uuid().as_bytes(),
+                        registration.identity_schema_name(),
+                        i64::from(registration.identity_schema_version()),
+                    ],
+                )?;
+                1
+            };
+        transaction.commit()?;
+        Ok(SourceScan {
+            source_id: registration.source_id().to_owned(),
+            generation,
+        })
+    }
+
+    /// Persists one cheap fingerprint and returns its consecutive unchanged
+    /// observation count. No full-file hash is implied by this operation.
+    pub fn observe_source_fingerprint(
+        &mut self,
+        scan: &SourceScan,
+        location: &LogicalLocation,
+        fingerprint: &SourceFingerprint,
+    ) -> Result<u32, CatalogError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_current_source_scan(&transaction, scan)?;
+        let existing = transaction
+            .query_row(
+                "SELECT byte_length, modified_seconds, modified_nanoseconds, device, inode,
+                        unchanged_observations
+                 FROM source_observations
+                 WHERE source_id = ?1 AND root_role = ?2 AND source_relative_path = ?3",
+                params![
+                    scan.source_id(),
+                    location.root_role(),
+                    location.source_relative_path()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let unchanged_observations = if let Some(existing) = existing {
+            let matches = existing.0 == as_i64(fingerprint.byte_length, "source byte length")?
+                && existing.1 == fingerprint.modified_seconds
+                && existing.2 == i64::from(fingerprint.modified_nanoseconds)
+                && existing.3 == optional_as_i64(fingerprint.device, "source device")?
+                && existing.4 == optional_as_i64(fingerprint.inode, "source inode")?;
+            if matches {
+                as_u64(existing.5, "unchanged observations")?
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        CatalogError::Corrupt("unchanged observation overflow".to_owned())
+                    })?
+            } else {
+                1
+            }
+        } else {
+            1
+        };
+        transaction.execute(
+            "INSERT INTO source_observations (
+                source_id, root_role, source_relative_path, byte_length,
+                modified_seconds, modified_nanoseconds, device, inode,
+                unchanged_observations, last_seen_generation
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(source_id, root_role, source_relative_path) DO UPDATE SET
+                 byte_length = excluded.byte_length,
+                 modified_seconds = excluded.modified_seconds,
+                 modified_nanoseconds = excluded.modified_nanoseconds,
+                 device = excluded.device,
+                 inode = excluded.inode,
+                 unchanged_observations = excluded.unchanged_observations,
+                 last_seen_generation = excluded.last_seen_generation",
+            params![
+                scan.source_id(),
+                location.root_role(),
+                location.source_relative_path(),
+                as_i64(fingerprint.byte_length, "source byte length")?,
+                fingerprint.modified_seconds,
+                i64::from(fingerprint.modified_nanoseconds),
+                optional_as_i64(fingerprint.device, "source device")?,
+                optional_as_i64(fingerprint.inode, "source inode")?,
+                as_i64(unchanged_observations, "unchanged observations")?,
+                as_i64(scan.generation(), "source scan generation")?,
+            ],
+        )?;
+        transaction.commit()?;
+        u32::try_from(unchanged_observations)
+            .map_err(|_| CatalogError::Corrupt("unchanged observations exceed u32".to_owned()))
+    }
+
+    /// Marks an already cataloged record as present in this scan. Calling it for
+    /// a new-but-not-yet-stable record is intentionally a no-op.
+    pub fn mark_source_record_seen(
+        &mut self,
+        scan: &SourceScan,
+        registration: &SourceRegistration,
+        identity: &RecordIdentity,
+    ) -> Result<(), CatalogError> {
+        if identity.producer_id() != registration.producer_id() {
+            return Err(CatalogError::SourceRegistrationConflict(
+                "record producer differs from source registration".to_owned(),
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_current_source_scan(&transaction, scan)?;
+        let Some(record) = find_record(&transaction, identity)? else {
+            transaction.commit()?;
+            return Ok(());
+        };
+        bind_source_record(&transaction, scan, record.id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn observe_present_from_source(
+        &mut self,
+        scan: &SourceScan,
+        registration: &SourceRegistration,
+        identity: &RecordIdentity,
+        location: &LogicalLocation,
+        revision: CanonicalRevision,
+    ) -> Result<Vec<ArchiveEvent>, CatalogError> {
+        if identity.producer_id() != registration.producer_id() {
+            return Err(CatalogError::SourceRegistrationConflict(
+                "record producer differs from source registration".to_owned(),
+            ));
+        }
+        self.ensure_current_source_scan(scan)?;
+        let events = self.observe_present(identity, location, revision)?;
+        self.mark_source_record_seen(scan, registration, identity)?;
+        Ok(events)
+    }
+
+    /// Completes a full, guard-verified scan. Passing `None` records a complete
+    /// scan and clears stale fingerprints, but never converts absence to a
+    /// tombstone. `Some(grace)` is allowed only after the adapter has verified
+    /// every configured root both before and after discovery/hashing.
+    pub fn complete_source_scan(
+        &mut self,
+        scan: &SourceScan,
+        tombstone_grace: Option<TombstoneGrace>,
+        committed_at_ms: i64,
+    ) -> Result<Vec<ArchiveEvent>, CatalogError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_current_source_scan(&transaction, scan)?;
+
+        let mut events = Vec::new();
+        if let Some(grace) = tombstone_grace {
+            let mut statement = transaction.prepare(
+                "SELECT record_id FROM source_records
+                 WHERE source_id = ?1 AND last_seen_generation < ?2",
+            )?;
+            let missing_record_ids = statement
+                .query_map(
+                    params![
+                        scan.source_id(),
+                        as_i64(scan.generation(), "source scan generation")?
+                    ],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+
+            for record_id in missing_record_ids {
+                let record_id = record_id_from_blob(record_id)?;
+                let missing = transaction
+                    .query_row(
+                        "SELECT first_missing_at_ms, complete_guarded_scans
+                     FROM tombstone_candidates WHERE record_id = ?1",
+                        params![record_id.as_uuid().as_bytes()],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
+                let (first_missing_at_ms, complete_guarded_scans) = if let Some((first, scans)) =
+                    missing
+                {
+                    (
+                        first,
+                        as_u64(scans, "complete guarded scans")?
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                CatalogError::Corrupt("tombstone scan count overflow".to_owned())
+                            })?,
+                    )
+                } else {
+                    (committed_at_ms, 1)
+                };
+                transaction.execute(
+                    "INSERT INTO tombstone_candidates (
+                        record_id, source_id, first_missing_at_ms, complete_guarded_scans
+                     ) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(record_id) DO UPDATE SET
+                         source_id = excluded.source_id,
+                         complete_guarded_scans = excluded.complete_guarded_scans",
+                    params![
+                        record_id.as_uuid().as_bytes(),
+                        scan.source_id(),
+                        first_missing_at_ms,
+                        as_i64(complete_guarded_scans, "complete guarded scans")?,
+                    ],
+                )?;
+                let elapsed_ms =
+                    u64::try_from(committed_at_ms.saturating_sub(first_missing_at_ms)).unwrap_or(0);
+                if complete_guarded_scans >= u64::from(grace.min_complete_scans())
+                    && elapsed_ms >= grace.min_elapsed_ms()
+                {
+                    let Some(mut record) = find_record_by_id(&transaction, record_id)? else {
+                        return Err(CatalogError::Corrupt(
+                            "source record disappeared from catalog".to_owned(),
+                        ));
+                    };
+                    if record.state == RecordState::Active {
+                        let revision_id = record.current_revision_id;
+                        events.push(transition(
+                            &transaction,
+                            &mut record,
+                            EventKind::RecordTombstoned,
+                            revision_id,
+                            None,
+                            RecordState::Tombstoned,
+                            committed_at_ms,
+                        )?);
+                    }
+                    transaction.execute(
+                        "DELETE FROM tombstone_candidates WHERE record_id = ?1",
+                        params![record_id.as_uuid().as_bytes()],
+                    )?;
+                }
+            }
+        }
+
+        transaction.execute(
+            "UPDATE source_state SET last_complete_generation = ?1 WHERE source_id = ?2",
+            params![
+                as_i64(scan.generation(), "source scan generation")?,
+                scan.source_id()
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM source_observations
+             WHERE source_id = ?1 AND last_seen_generation < ?2",
+            params![
+                scan.source_id(),
+                as_i64(scan.generation(), "source scan generation")?
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(events)
+    }
+
+    pub fn complete_source_scan_now(
+        &mut self,
+        scan: &SourceScan,
+        tombstone_grace: Option<TombstoneGrace>,
+    ) -> Result<Vec<ArchiveEvent>, CatalogError> {
+        self.complete_source_scan(scan, tombstone_grace, now_ms()?)
+    }
+
+    fn ensure_current_source_scan(&self, scan: &SourceScan) -> Result<(), CatalogError> {
+        ensure_current_source_scan(&self.connection, scan)
     }
 
     /// Observe one verified present record. The caller owns source safety and
@@ -300,6 +782,98 @@ fn find_record(
         )
         .optional()
         .map_err(Into::into)
+}
+
+fn find_record_by_id(
+    connection: &Connection,
+    record_id: RecordId,
+) -> Result<Option<RecordRow>, CatalogError> {
+    let identity = connection
+        .query_row(
+            "SELECT producer_id, agent_namespace, session_id, record_kind, record_key
+             FROM records WHERE id = ?1",
+            params![record_id.as_uuid().as_bytes()],
+            |row| {
+                let producer_id = ProducerId::from_uuid(
+                    uuid_from_blob(&row.get::<_, Vec<u8>>(0)?).map_err(to_sql_conversion_error)?,
+                );
+                RecordIdentity::new(
+                    producer_id,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                )
+                .map_err(|error| to_sql_conversion_error(error.into()))
+            },
+        )
+        .optional()?;
+    identity
+        .map(|identity| find_record(connection, &identity))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn bind_source_record(
+    transaction: &Transaction<'_>,
+    scan: &SourceScan,
+    record_id: RecordId,
+) -> Result<(), CatalogError> {
+    let existing_source = transaction
+        .query_row(
+            "SELECT source_id FROM source_records WHERE record_id = ?1",
+            params![record_id.as_uuid().as_bytes()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(existing_source) = existing_source {
+        if existing_source != scan.source_id() {
+            return Err(CatalogError::SourceRegistrationConflict(format!(
+                "record is already owned by source {existing_source:?}"
+            )));
+        }
+    }
+    transaction.execute(
+        "INSERT INTO source_records (source_id, record_id, last_seen_generation)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(record_id) DO UPDATE SET
+             last_seen_generation = excluded.last_seen_generation",
+        params![
+            scan.source_id(),
+            record_id.as_uuid().as_bytes(),
+            as_i64(scan.generation(), "source scan generation")?,
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM tombstone_candidates WHERE record_id = ?1",
+        params![record_id.as_uuid().as_bytes()],
+    )?;
+    Ok(())
+}
+
+fn ensure_current_source_scan(
+    connection: &Connection,
+    scan: &SourceScan,
+) -> Result<(), CatalogError> {
+    let (next_generation, last_complete_generation) = connection
+        .query_row(
+            "SELECT next_generation, last_complete_generation
+             FROM source_state WHERE source_id = ?1",
+            params![scan.source_id()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| CatalogError::SourceScanConflict("source is not registered".to_owned()))?;
+    let next_generation = as_u64(next_generation, "source scan generation")?;
+    let last_complete_generation = as_u64(last_complete_generation, "source scan generation")?;
+    if scan.generation() != next_generation || scan.generation() <= last_complete_generation {
+        return Err(CatalogError::SourceScanConflict(format!(
+            "{} generation {} is not current",
+            scan.source_id(),
+            scan.generation()
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_revision(
@@ -551,7 +1125,50 @@ fn migrate(connection: &mut Connection) -> Result<(), CatalogError> {
         )?;
         transaction.execute(
             "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",
-            params![SCHEMA_VERSION, now_ms()?],
+            params![1, now_ms()?],
+        )?;
+    }
+    if found < 2 {
+        transaction.execute_batch(
+            "CREATE TABLE source_state (
+                 source_id TEXT PRIMARY KEY NOT NULL,
+                 producer_id BLOB NOT NULL CHECK(length(producer_id) = 16),
+                 identity_schema_name TEXT NOT NULL,
+                 identity_schema_version INTEGER NOT NULL CHECK(identity_schema_version > 0),
+                 next_generation INTEGER NOT NULL CHECK(next_generation >= 0),
+                 last_complete_generation INTEGER NOT NULL CHECK(last_complete_generation >= 0)
+             );
+             CREATE TABLE source_observations (
+                 source_id TEXT NOT NULL REFERENCES source_state(source_id),
+                 root_role TEXT NOT NULL,
+                 source_relative_path TEXT NOT NULL,
+                 byte_length INTEGER NOT NULL CHECK(byte_length >= 0),
+                 modified_seconds INTEGER NOT NULL,
+                 modified_nanoseconds INTEGER NOT NULL CHECK(modified_nanoseconds >= 0 AND modified_nanoseconds < 1000000000),
+                 device INTEGER NULL,
+                 inode INTEGER NULL,
+                 unchanged_observations INTEGER NOT NULL CHECK(unchanged_observations > 0),
+                 last_seen_generation INTEGER NOT NULL CHECK(last_seen_generation > 0),
+                 PRIMARY KEY(source_id, root_role, source_relative_path)
+             );
+             CREATE TABLE source_records (
+                 source_id TEXT NOT NULL REFERENCES source_state(source_id),
+                 record_id BLOB NOT NULL UNIQUE REFERENCES records(id),
+                 last_seen_generation INTEGER NOT NULL CHECK(last_seen_generation > 0),
+                 PRIMARY KEY(source_id, record_id)
+             );
+             CREATE TABLE tombstone_candidates (
+                 record_id BLOB PRIMARY KEY NOT NULL REFERENCES records(id),
+                 source_id TEXT NOT NULL REFERENCES source_state(source_id),
+                 first_missing_at_ms INTEGER NOT NULL,
+                 complete_guarded_scans INTEGER NOT NULL CHECK(complete_guarded_scans > 0)
+             );
+             CREATE INDEX source_records_generation ON source_records(source_id, last_seen_generation);
+             CREATE INDEX source_observations_generation ON source_observations(source_id, last_seen_generation);",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",
+            params![2, now_ms()?],
         )?;
     }
     transaction.commit()?;
@@ -566,9 +1183,43 @@ fn now_ms() -> Result<i64, CatalogError> {
         .map_err(|_| CatalogError::Corrupt("Unix timestamp exceeds i64 milliseconds".to_owned()))
 }
 
+fn unix_time_parts(time: SystemTime) -> (i64, u32) {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+            duration.subsec_nanos(),
+        ),
+        Err(error) => {
+            let duration = error.duration();
+            let seconds = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
+            if duration.subsec_nanos() == 0 {
+                (-seconds, 0)
+            } else {
+                (
+                    seconds.saturating_add(1).saturating_neg(),
+                    1_000_000_000 - duration.subsec_nanos(),
+                )
+            }
+        }
+    }
+}
+
+fn valid_source_field(field: &str, value: String) -> Result<String, CatalogError> {
+    if value.is_empty() || value.trim() != value || value.contains('\0') {
+        return Err(CatalogError::InvalidSourceRegistration(format!(
+            "{field} must be non-empty, trimmed, and free of NUL bytes"
+        )));
+    }
+    Ok(value)
+}
+
 fn as_i64(value: u64, field: &'static str) -> Result<i64, CatalogError> {
     i64::try_from(value)
         .map_err(|_| CatalogError::Corrupt(format!("{field} exceeds SQLite INTEGER range")))
+}
+
+fn optional_as_i64(value: Option<u64>, field: &'static str) -> Result<Option<i64>, CatalogError> {
+    value.map(|value| as_i64(value, field)).transpose()
 }
 
 fn as_u64(value: i64, field: &'static str) -> Result<u64, CatalogError> {
@@ -600,6 +1251,7 @@ fn to_sql_conversion_error(error: CatalogError) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::Catalog;
+    use super::{SourceRegistration, TombstoneGrace};
     use crate::domain::{
         CanonicalRevision, EventKind, LogicalLocation, ProducerId, RecordIdentity, RecordState,
     };
@@ -623,7 +1275,7 @@ mod tests {
     #[test]
     fn schema_and_unchanged_observation_are_stable() {
         let mut catalog = Catalog::open_in_memory().unwrap();
-        assert_eq!(catalog.schema_version().unwrap(), 1);
+        assert_eq!(catalog.schema_version().unwrap(), 2);
         let identity = identity();
         let revision = CanonicalRevision::from_bytes(b"first\n");
 
@@ -758,5 +1410,70 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].sequence, 1);
         assert_eq!(current.revision, Some(revision));
+    }
+
+    #[test]
+    fn source_tombstone_requires_both_complete_scan_and_elapsed_grace() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let producer = ProducerId::new();
+        let registration = SourceRegistration::new("source-a", producer, "fixture", 1).unwrap();
+        let identity =
+            RecordIdentity::new(producer, "codex", "session-a", "transcript", "primary").unwrap();
+        let location = location("active/a.jsonl");
+        let revision = CanonicalRevision::from_bytes(b"first\n");
+        let grace = TombstoneGrace::new(2, 100).unwrap();
+
+        let first = catalog.begin_source_scan(&registration).unwrap();
+        catalog
+            .observe_present_from_source(&first, &registration, &identity, &location, revision)
+            .unwrap();
+        assert!(
+            catalog
+                .complete_source_scan(&first, Some(grace), 100)
+                .unwrap()
+                .is_empty()
+        );
+
+        let second = catalog.begin_source_scan(&registration).unwrap();
+        assert!(
+            catalog
+                .complete_source_scan(&second, Some(grace), 110)
+                .unwrap()
+                .is_empty()
+        );
+        let third = catalog.begin_source_scan(&registration).unwrap();
+        assert!(
+            catalog
+                .complete_source_scan(&third, Some(grace), 199)
+                .unwrap()
+                .is_empty()
+        );
+        let fourth = catalog.begin_source_scan(&registration).unwrap();
+        let tombstones = catalog
+            .complete_source_scan(&fourth, Some(grace), 210)
+            .unwrap();
+
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].kind, EventKind::RecordTombstoned);
+    }
+
+    #[test]
+    fn stale_source_scan_cannot_complete_after_a_newer_generation_starts() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let registration =
+            SourceRegistration::new("source-a", ProducerId::new(), "fixture", 1).unwrap();
+        let first = catalog.begin_source_scan(&registration).unwrap();
+        let second = catalog.begin_source_scan(&registration).unwrap();
+
+        assert!(matches!(
+            catalog.complete_source_scan(&first, None, 100),
+            Err(super::CatalogError::SourceScanConflict(_))
+        ));
+        assert!(
+            catalog
+                .complete_source_scan(&second, None, 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

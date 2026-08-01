@@ -14,8 +14,9 @@ V1.5 implementation is underway. The current checkpoint implements the shared
 Rust domain and durable SQLite event catalog, with fixtures for canonical
 revisions, path-independent identity, moves, rewrites, tombstones/restores, and
 multiple records per session. It also has a guarded read-only filesystem scanner
-foundation with a versioned Codex rollout schema. Durable scan-state/tombstone
-handling, source-byte delivery, and real consumers remain pending. See
+with a versioned Codex rollout schema, durable scan state, and guarded
+tombstone grace. Source-byte delivery, integrity scrub, and real consumers
+remain pending. See
 [implementation status](docs/implementation-status.md).
 
 V2's protocol is detailed but intentionally not frozen until the shared V1.5

@@ -32,6 +32,12 @@ The read-only source foundation provides:
 - two unchanged observations before a candidate is hashed;
 - pre/post descriptor fingerprints, full streaming BLAKE3 hashing, duplicate
   identity rejection before commit, and change-during-hash rejection.
+- durable source registration, scan generations, and fingerprint observations;
+- source-to-record presence tracking across roots and scanner restarts;
+- deletion disabled by default, with guarded deletion requiring root checks at
+  both scan boundaries plus complete-scan and elapsed-time grace;
+- stale-scan rejection, so a superseded scan cannot later overwrite presence
+  state or emit a delayed tombstone.
 
 Codex's local rollout layout is treated as a locally observed, versioned source
 schema—not a public Codex storage protocol. An unexpected layout or metadata
@@ -39,10 +45,9 @@ mismatch is rejected rather than guessed.
 
 ## Remaining V1.5 slices
 
-1. Finish source durability: persist scan fingerprints and source generations in
-   the catalog, root-guarded tombstone grace, active/archive move handling, and
-   a byte-budgeted integrity scrub. The current stability observation is
-   intentionally process-local and is not yet promotion-ready.
+1. Finish source operational proof: a resumable byte-budgeted integrity scrub,
+   scan/source health status, source-level resource limits, and representative
+   large-record measurements.
 2. Payload and delivery: held-descriptor `RevisionReader`, bounded
    materialization for path-only consumers, subscriptions, leases, per-record
    ordering, outcomes, replay, and an idempotent fake consumer.

@@ -4,9 +4,9 @@
 //! record identity, while [`Catalog`] remains the authority for revisions and
 //! ordered events.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::{CString, OsStr};
-use std::fs::{self, File, Metadata};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
@@ -14,7 +14,9 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::catalog::{Catalog, CatalogError};
+use crate::catalog::{
+    Catalog, CatalogError, SourceFingerprint, SourceRegistration, TombstoneGrace,
+};
 use crate::domain::{
     ArchiveEvent, CanonicalRevision, DomainError, LogicalLocation, ProducerId, RecordIdentity,
 };
@@ -227,9 +229,9 @@ impl SourceRoot {
 pub enum DeletionMode {
     /// A source may observe present records, but absence never becomes deletion.
     Disabled,
-    /// Guard checks are mandatory before a later tombstone/grace implementation
-    /// may interpret absence as deletion.
-    Guarded,
+    /// Guard checks plus the configured complete-scan/time grace are mandatory
+    /// before absence may become a tombstone.
+    Guarded(TombstoneGrace),
 }
 
 #[derive(Clone, Debug)]
@@ -269,7 +271,9 @@ impl SourceConfig {
                 "source root roles must be unique".to_owned(),
             ));
         }
-        if deletion_mode == DeletionMode::Guarded && roots.iter().any(|root| root.guard.is_none()) {
+        if matches!(deletion_mode, DeletionMode::Guarded(_))
+            && roots.iter().any(|root| root.guard.is_none())
+        {
             return Err(SourceError::InvalidConfiguration(
                 "guarded deletion requires a root guard for every root".to_owned(),
             ));
@@ -291,6 +295,19 @@ impl SourceConfig {
     pub fn deletion_mode(&self) -> DeletionMode {
         self.deletion_mode
     }
+
+    fn registration(
+        &self,
+        identity_schema: &IdentitySchema,
+    ) -> Result<SourceRegistration, SourceError> {
+        SourceRegistration::new(
+            &self.source_id,
+            self.producer_id,
+            identity_schema.name(),
+            identity_schema.version(),
+        )
+        .map_err(SourceError::Catalog)
+    }
 }
 
 pub trait RevisionHasher {
@@ -307,14 +324,12 @@ impl RevisionHasher for Blake3RevisionHasher {
     }
 }
 
-/// A source scanner keeps only short-lived fingerprint observations. Durable
-/// scan fingerprints and deletion grace are deliberately added with the catalog
-/// persistence slice; this scanner never infers deletion on its own.
+/// A source scanner delegates durable stability and deletion state to the
+/// catalog; it retains no correctness-relevant observations in process memory.
 pub struct Reconciler<L, H = Blake3RevisionHasher> {
     config: SourceConfig,
     layout: L,
     hasher: H,
-    observations: HashMap<SourceLocationKey, FingerprintObservation>,
 }
 
 impl<L> Reconciler<L, Blake3RevisionHasher>
@@ -336,7 +351,6 @@ where
             config,
             layout,
             hasher,
-            observations: HashMap::new(),
         }
     }
 
@@ -346,6 +360,10 @@ where
 
     pub fn scan(&mut self, catalog: &mut Catalog) -> Result<ReconcileReport, SourceError> {
         self.verify_roots()?;
+        let registration = self.config.registration(&self.layout.identity_schema())?;
+        let scan = catalog
+            .begin_source_scan(&registration)
+            .map_err(SourceError::Catalog)?;
         let raw_candidates = self.enumerate_candidates()?;
         let mut report = ReconcileReport {
             files_enumerated: raw_candidates.len() as u64,
@@ -357,15 +375,11 @@ where
             if !self.layout.is_candidate_path(&candidate.relative_path) {
                 continue;
             }
-            if !self.is_stable(&candidate) {
-                report.awaiting_stability += 1;
-                continue;
-            }
-
             let root = &self.config.roots[candidate.root_index];
             let mut file = open_file_beneath(&root.path, &candidate.relative_path)?;
             let current_fingerprint =
-                Fingerprint::from_metadata(&file.metadata().map_err(SourceError::Read)?)?;
+                SourceFingerprint::from_metadata(&file.metadata().map_err(SourceError::Read)?)
+                    .map_err(SourceError::Read)?;
             if current_fingerprint != candidate.fingerprint {
                 report.changed_during_scan += 1;
                 continue;
@@ -394,9 +408,25 @@ where
 
         let mut accepted = Vec::new();
         for candidate in parsed_candidates {
+            let unchanged_observations = catalog
+                .observe_source_fingerprint(
+                    &scan,
+                    candidate.parsed.location(),
+                    &candidate.candidate.fingerprint,
+                )
+                .map_err(SourceError::Catalog)?;
+            catalog
+                .mark_source_record_seen(&scan, &registration, candidate.parsed.identity())
+                .map_err(SourceError::Catalog)?;
+            if unchanged_observations < self.config.stability_policy.min_unchanged_observations() {
+                report.awaiting_stability += 1;
+                continue;
+            }
             let root = &self.config.roots[candidate.candidate.root_index];
             let mut file = open_file_beneath(&root.path, &candidate.candidate.relative_path)?;
-            let before = Fingerprint::from_metadata(&file.metadata().map_err(SourceError::Read)?)?;
+            let before =
+                SourceFingerprint::from_metadata(&file.metadata().map_err(SourceError::Read)?)
+                    .map_err(SourceError::Read)?;
             if before != candidate.candidate.fingerprint {
                 report.changed_during_scan += 1;
                 continue;
@@ -413,7 +443,9 @@ where
             }
 
             let revision = self.hasher.hash(&mut file)?;
-            let after = Fingerprint::from_metadata(&file.metadata().map_err(SourceError::Read)?)?;
+            let after =
+                SourceFingerprint::from_metadata(&file.metadata().map_err(SourceError::Read)?)
+                    .map_err(SourceError::Read)?;
             if before != after {
                 report.changed_during_scan += 1;
                 continue;
@@ -430,10 +462,24 @@ where
         self.verify_roots()?;
         for (parsed, revision) in accepted {
             let events = catalog
-                .observe_present(parsed.identity(), parsed.location(), revision)
+                .observe_present_from_source(
+                    &scan,
+                    &registration,
+                    parsed.identity(),
+                    parsed.location(),
+                    revision,
+                )
                 .map_err(SourceError::Catalog)?;
             report.events.extend(events);
         }
+        let tombstone_grace = match self.config.deletion_mode {
+            DeletionMode::Disabled => None,
+            DeletionMode::Guarded(grace) => Some(grace),
+        };
+        let tombstone_events = catalog
+            .complete_source_scan_now(&scan, tombstone_grace)
+            .map_err(SourceError::Catalog)?;
+        report.events.extend(tombstone_events);
         Ok(report)
     }
 
@@ -466,29 +512,6 @@ where
         }
         Ok(candidates)
     }
-
-    fn is_stable(&mut self, candidate: &FileCandidate) -> bool {
-        let key = SourceLocationKey {
-            root_index: candidate.root_index,
-            relative_path: candidate.relative_path.clone(),
-        };
-        let observation = self
-            .observations
-            .entry(key)
-            .or_insert(FingerprintObservation {
-                fingerprint: candidate.fingerprint.clone(),
-                unchanged_observations: 0,
-            });
-        if observation.fingerprint == candidate.fingerprint {
-            observation.unchanged_observations =
-                observation.unchanged_observations.saturating_add(1);
-        } else {
-            observation.fingerprint = candidate.fingerprint.clone();
-            observation.unchanged_observations = 1;
-        }
-        observation.unchanged_observations
-            >= self.config.stability_policy.min_unchanged_observations()
-    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -504,51 +527,7 @@ pub struct ReconcileReport {
 struct FileCandidate {
     root_index: usize,
     relative_path: PathBuf,
-    fingerprint: Fingerprint,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct SourceLocationKey {
-    root_index: usize,
-    relative_path: PathBuf,
-}
-
-#[derive(Clone, Debug)]
-struct FingerprintObservation {
-    fingerprint: Fingerprint,
-    unchanged_observations: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Fingerprint {
-    byte_length: u64,
-    modified: std::time::SystemTime,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-}
-
-impl Fingerprint {
-    fn from_metadata(metadata: &Metadata) -> Result<Self, SourceError> {
-        if !metadata.is_file() {
-            return Err(SourceError::UnexpectedFileType);
-        }
-        Ok(Self {
-            byte_length: metadata.len(),
-            modified: metadata.modified().map_err(SourceError::Read)?,
-            #[cfg(unix)]
-            device: {
-                use std::os::unix::fs::MetadataExt;
-                metadata.dev()
-            },
-            #[cfg(unix)]
-            inode: {
-                use std::os::unix::fs::MetadataExt;
-                metadata.ino()
-            },
-        })
-    }
+    fingerprint: SourceFingerprint,
 }
 
 #[derive(Clone, Debug)]
@@ -579,7 +558,8 @@ fn enumerate_root(
             candidates.push(FileCandidate {
                 root_index,
                 relative_path,
-                fingerprint: Fingerprint::from_metadata(&metadata)?,
+                fingerprint: SourceFingerprint::from_metadata(&metadata)
+                    .map_err(SourceError::Read)?,
             });
         }
     }
@@ -826,7 +806,7 @@ mod tests {
 
     use super::{
         Blake3RevisionHasher, CodexRolloutLayout, DeletionMode, Reconciler, RevisionHasher,
-        RootGuard, SourceConfig, SourceError, SourceRoot, StabilityPolicy,
+        RootGuard, SourceConfig, SourceError, SourceRoot, StabilityPolicy, TombstoneGrace,
     };
     use crate::catalog::Catalog;
     use crate::domain::{CanonicalRevision, EventKind, ProducerId};
@@ -860,16 +840,18 @@ mod tests {
         .unwrap()
     }
 
+    fn guarded_deletion() -> DeletionMode {
+        DeletionMode::Guarded(TombstoneGrace::default())
+    }
+
     #[test]
     fn codex_source_waits_for_stability_then_tracks_rewrite() {
         let directory = tempdir().unwrap();
         let root = directory.path();
         let id = Uuid::new_v4();
         let path = session_file(root, id, "first\n");
-        let mut reconciler = Reconciler::new(
-            guarded_config(root, DeletionMode::Guarded),
-            CodexRolloutLayout,
-        );
+        let mut reconciler =
+            Reconciler::new(guarded_config(root, guarded_deletion()), CodexRolloutLayout);
         let mut catalog = Catalog::open_in_memory().unwrap();
 
         let first = reconciler.scan(&mut catalog).unwrap();
@@ -894,11 +876,128 @@ mod tests {
     }
 
     #[test]
+    fn stability_observations_survive_reconciler_restart() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("source");
+        fs::create_dir_all(&root).unwrap();
+        session_file(&root, Uuid::new_v4(), "first\n");
+        let config = guarded_config(&root, guarded_deletion());
+        let database = directory.path().join("catalog.sqlite3");
+
+        let first = {
+            let mut catalog = Catalog::open(&database).unwrap();
+            Reconciler::new(config.clone(), CodexRolloutLayout)
+                .scan(&mut catalog)
+                .unwrap()
+        };
+        let second = {
+            let mut catalog = Catalog::open(&database).unwrap();
+            Reconciler::new(config, CodexRolloutLayout)
+                .scan(&mut catalog)
+                .unwrap()
+        };
+
+        assert!(first.events.is_empty());
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].kind, EventKind::RevisionCommitted);
+    }
+
+    #[test]
+    fn guarded_absence_requires_two_complete_scans_before_tombstone() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let path = session_file(root, Uuid::new_v4(), "first\n");
+        let mut reconciler =
+            Reconciler::new(guarded_config(root, guarded_deletion()), CodexRolloutLayout);
+        let mut catalog = Catalog::open_in_memory().unwrap();
+
+        reconciler.scan(&mut catalog).unwrap();
+        reconciler.scan(&mut catalog).unwrap();
+        fs::remove_file(path).unwrap();
+        let first_missing = reconciler.scan(&mut catalog).unwrap();
+        let second_missing = reconciler.scan(&mut catalog).unwrap();
+
+        assert!(first_missing.events.is_empty());
+        assert_eq!(second_missing.events.len(), 1);
+        assert_eq!(second_missing.events[0].kind, EventKind::RecordTombstoned);
+    }
+
+    #[test]
+    fn disabled_deletion_never_turns_absence_into_a_tombstone() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let path = session_file(root, Uuid::new_v4(), "first\n");
+        let mut reconciler = Reconciler::new(
+            guarded_config(root, DeletionMode::Disabled),
+            CodexRolloutLayout,
+        );
+        let mut catalog = Catalog::open_in_memory().unwrap();
+
+        reconciler.scan(&mut catalog).unwrap();
+        reconciler.scan(&mut catalog).unwrap();
+        fs::remove_file(path).unwrap();
+        let first_missing = reconciler.scan(&mut catalog).unwrap();
+        let second_missing = reconciler.scan(&mut catalog).unwrap();
+
+        assert!(first_missing.events.is_empty());
+        assert!(second_missing.events.is_empty());
+        assert_eq!(catalog.events_after(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_cross_root_move_is_seen_before_tombstone_grace() {
+        let directory = tempdir().unwrap();
+        let active = directory.path().join("active");
+        let archived = directory.path().join("archived");
+        fs::create_dir_all(&active).unwrap();
+        fs::create_dir_all(&archived).unwrap();
+        fs::write(active.join(".bookkeeper-root"), b"active root\n").unwrap();
+        fs::write(archived.join(".bookkeeper-root"), b"archived root\n").unwrap();
+        let active_guard =
+            RootGuard::from_marker_bytes(".bookkeeper-root", b"active root\n").unwrap();
+        let archived_guard =
+            RootGuard::from_marker_bytes(".bookkeeper-root", b"archived root\n").unwrap();
+        let active_root = SourceRoot::new("active", &active, Some(active_guard)).unwrap();
+        let archived_root = SourceRoot::new("archived", &archived, Some(archived_guard)).unwrap();
+        let config = SourceConfig::new(
+            "moving-source",
+            ProducerId::new(),
+            vec![active_root, archived_root],
+            guarded_deletion(),
+            StabilityPolicy::new(2).unwrap(),
+        )
+        .unwrap();
+        let path = session_file(&active, Uuid::new_v4(), "first\n");
+        let archived_sessions = archived.join("sessions");
+        fs::create_dir_all(&archived_sessions).unwrap();
+        let moved = archived_sessions.join(path.file_name().unwrap());
+        let mut reconciler = Reconciler::new(config, CodexRolloutLayout);
+        let mut catalog = Catalog::open_in_memory().unwrap();
+
+        reconciler.scan(&mut catalog).unwrap();
+        reconciler.scan(&mut catalog).unwrap();
+        fs::rename(&path, &moved).unwrap();
+        let first_move_scan = reconciler.scan(&mut catalog).unwrap();
+        let stable_move = reconciler.scan(&mut catalog).unwrap();
+
+        assert!(first_move_scan.events.is_empty());
+        assert_eq!(stable_move.events.len(), 1);
+        assert_eq!(stable_move.events[0].kind, EventKind::LocationChanged);
+        assert!(
+            catalog
+                .events_after(0)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != EventKind::RecordTombstoned)
+        );
+    }
+
+    #[test]
     fn guard_failure_creates_no_catalog_event() {
         let directory = tempdir().unwrap();
         let root = directory.path();
         session_file(root, Uuid::new_v4(), "body\n");
-        let config = guarded_config(root, DeletionMode::Guarded);
+        let config = guarded_config(root, guarded_deletion());
         fs::write(root.join(".bookkeeper-root"), b"wrong root\n").unwrap();
         let mut reconciler = Reconciler::new(config, CodexRolloutLayout);
         let mut catalog = Catalog::open_in_memory().unwrap();
@@ -908,6 +1007,28 @@ mod tests {
             Err(SourceError::UnhealthyRoot { .. })
         ));
         assert!(catalog.events_after(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_later_guard_failure_cannot_tombstone_a_known_record() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        session_file(root, Uuid::new_v4(), "body\n");
+        let mut reconciler =
+            Reconciler::new(guarded_config(root, guarded_deletion()), CodexRolloutLayout);
+        let mut catalog = Catalog::open_in_memory().unwrap();
+
+        reconciler.scan(&mut catalog).unwrap();
+        reconciler.scan(&mut catalog).unwrap();
+        fs::write(root.join(".bookkeeper-root"), b"wrong root\n").unwrap();
+        assert!(matches!(
+            reconciler.scan(&mut catalog),
+            Err(SourceError::UnhealthyRoot { .. })
+        ));
+        let events = catalog.events_after(0).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::RevisionCommitted);
     }
 
     #[test]
@@ -930,7 +1051,6 @@ mod tests {
         );
         let mut catalog = Catalog::open_in_memory().unwrap();
 
-        reconciler.scan(&mut catalog).unwrap();
         assert!(matches!(
             reconciler.scan(&mut catalog),
             Err(SourceError::InvalidProviderRecord { .. })
@@ -958,7 +1078,6 @@ mod tests {
         );
         let mut catalog = Catalog::open_in_memory().unwrap();
 
-        reconciler.scan(&mut catalog).unwrap();
         assert!(matches!(
             reconciler.scan(&mut catalog),
             Err(SourceError::DuplicateLiveIdentity { .. })
@@ -1010,7 +1129,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let root = directory.path();
         session_file(root, Uuid::new_v4(), "body\n");
-        let config = guarded_config(root, DeletionMode::Guarded);
+        let config = guarded_config(root, guarded_deletion());
         let mut reconciler = Reconciler::with_hasher(
             config,
             CodexRolloutLayout,
