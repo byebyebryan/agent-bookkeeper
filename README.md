@@ -8,11 +8,17 @@ It complements, rather than replaces, an overall memory system such as [Agent Hi
 - An archive or retrieval consumer turns those records into searchable evidence.
 - A learned-memory consumer may derive concise, fallible working context from that evidence.
 
-## Design status
+## Implementation status
 
-The design is ready to begin a V1.5 implementation proof; V2's protocol is
-detailed but intentionally not frozen until the shared V1.5 domain model passes
-its gates. The plan is staged:
+V1.5 implementation is underway. The current checkpoint implements the shared
+Rust domain and durable SQLite event catalog, with fixtures for canonical
+revisions, path-independent identity, moves, rewrites, tombstones/restores, and
+multiple records per session. It does not yet scan a mirror, open source bytes
+for consumer delivery, or run an actual consumer. See
+[implementation status](docs/implementation-status.md).
+
+V2's protocol is detailed but intentionally not frozen until the shared V1.5
+domain model passes its gates. The plan is staged:
 
 - **V1 — external mirror:** a minimal, reliable raw-file mirror using an operator-provided destination.
 - **V1.5 — catalog and controller:** revision-aware discovery and independent consumer cursors over the V1 mirror.
@@ -41,6 +47,7 @@ and rebuildable current projection.
 - [Evolution boundary](docs/evolution-boundary.md) — overlap, dependencies, reuse, and cutover gates.
 - [Transport contract](docs/transport-contract.md) — identities, revisions, delivery, and durability semantics.
 - [Proof plan](docs/proof-plan.md) — functional and operational acceptance gates.
+- [Implementation status](docs/implementation-status.md) — implemented slices and remaining proof work.
 
 ## Non-goals
 
@@ -52,6 +59,9 @@ and rebuildable current projection.
 ## Local checks
 
 ```sh
+rtk cargo fmt --check
+rtk cargo clippy --all-targets -- -D warnings
+rtk cargo test
 rtk git diff --check
 ```
 

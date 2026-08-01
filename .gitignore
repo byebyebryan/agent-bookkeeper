@@ -12,6 +12,7 @@ sessions/
 archived_sessions/
 
 # Language and editor artifacts
+target/
 __pycache__/
 .pytest_cache/
 .mypy_cache/
