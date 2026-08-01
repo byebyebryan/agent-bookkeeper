@@ -7,9 +7,14 @@
 
 pub mod catalog;
 pub mod domain;
+pub mod source_fs;
 
 pub use catalog::{Catalog, CatalogError, CurrentRecord};
 pub use domain::{
     ArchiveEvent, CanonicalRevision, DeliveryOutcome, DomainError, EventKind, LogicalLocation,
     ProducerId, RecordIdentity, RecordState,
+};
+pub use source_fs::{
+    Blake3RevisionHasher, CodexRolloutLayout, DeletionMode, IdentitySchema, LayoutPlugin,
+    ReconcileReport, Reconciler, RootGuard, SourceConfig, SourceError, SourceRoot, StabilityPolicy,
 };
