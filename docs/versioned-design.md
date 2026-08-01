@@ -28,12 +28,16 @@ V1.5 adds a service-packaged controller that reads the V1 raw mirror without tak
 - scans configured source roots for cheap metadata changes;
 - hashes only new or changed stable files;
 - records identity, current location, revision, deletion state, and observed time;
-- exposes each committed revision once to each registered consumer through durable cursors;
+- appends ordered archive events to a durable ledger;
+- delivers each eligible event at least once until each consumer acknowledges it;
 - coalesces work so an archive of many files does not cause a simultaneous full re-ingestion burst.
 
 This layer separates ingestion policy from transport. An evidence archive can ingest a completed session while a learned-memory system advances at a different rate or is disabled entirely. A path move changes location metadata instead of being reclassified as a wholly new record. If derived consumer state becomes unsuitable, it can be reset and replayed from the raw mirror.
 
 V1.5 is useful even if V2 is later adopted: it establishes the catalog schema, revision protocol, provenance, backpressure controls, and consumer boundary that V2 will use.
+
+The detailed design is in [v1.5-design.md](v1.5-design.md). Its filesystem
+source adapter remains a V2 import, recovery, and audit tool.
 
 ## V2: service-owned transport
 
@@ -45,15 +49,19 @@ hook -> local scanner/spool -> incremental transport API -> service staging
                                                     -> canonical raw projection + catalog
 ```
 
-The client discovers records, calculates the delta from its acknowledged state, and uploads only missing data. A practical implementation can combine established components:
-
-- resumable upload protocol support, such as tus, for interrupted transfers;
-- rolling-delta tooling, such as librsync, where a remote base file is useful;
-- content-defined chunking plus BLAKE3 addresses when deduplication and immutable blobs are desirable.
+The client discovers records, calculates the delta from its acknowledged state,
+and uploads only missing data. The initial proof uses versioned, fixed 4 MiB
+BLAKE3-addressed chunks. Each bounded chunk is independently idempotent, so tus
+is unnecessary for the first proof; librsync and content-defined chunking remain
+measured future options rather than required protocol dependencies.
 
 The protocol must support a first full seed, append-only updates, rewrite/truncation fallback, and atomic generation commit. Chunking is an implementation detail: the archive must still be able to materialize ordinary, byte-exact session files for debugging, export, and downstream consumers.
 
 V2 reduces remote filesystem exposure and makes the deployment portable, but it should not be started merely to avoid a small V1 inconvenience. The V1/V1.5 acceptance gates provide the evidence needed to choose it.
+
+See [v2-design.md](v2-design.md) for the client, archive-store, commit, and
+cutover design. [evolution-boundary.md](evolution-boundary.md) lists every
+component reused from V1.5 and every component V2 adds.
 
 ## Explicitly deferred decisions
 
@@ -61,4 +69,4 @@ V2 reduces remote filesystem exposure and makes the deployment portable, but it 
 - Multi-user tenancy and authorization model.
 - Backend choice for canonical raw storage.
 - Canonical event envelope and supported agent formats.
-- Whether content-defined chunking is needed before real multi-device scale demonstrates its value.
+- Whether measured rewrite behavior justifies a content-defined chunk profile.

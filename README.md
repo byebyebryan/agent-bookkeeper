@@ -10,7 +10,9 @@ It complements, rather than replaces, an overall memory system such as [Agent Hi
 
 ## Design status
 
-This is a design bootstrap. The versioned plan is intentionally staged:
+The design is ready to begin a V1.5 implementation proof; V2's protocol is
+detailed but intentionally not frozen until the shared V1.5 domain model passes
+its gates. The plan is staged:
 
 - **V1 — external mirror:** a minimal, reliable raw-file mirror using an operator-provided destination.
 - **V1.5 — catalog and controller:** revision-aware discovery and independent consumer cursors over the V1 mirror.
@@ -18,10 +20,17 @@ This is a design bootstrap. The versioned plan is intentionally staged:
 
 The raw archive remains canonical throughout. Derived indexes and consumer output must be safe to discard and rebuild from it.
 
+The central evolution rule is: V1.5 establishes stable identity, revisions,
+the event ledger, and consumer delivery; V2 reuses those contracts and adds the
+client, upload API, canonical object store, and raw projection.
+
 ## Documents
 
 - [Architecture](docs/architecture.md) — scope, ownership, and data flow.
 - [Versioned design](docs/versioned-design.md) — V1, V1.5, and V2 decisions.
+- [V1.5 design](docs/v1.5-design.md) — catalog, reconciliation, durable events, and consumer delivery.
+- [V2 design](docs/v2-design.md) — asynchronous client, chunk transport, archive storage, and commit protocol.
+- [Evolution boundary](docs/evolution-boundary.md) — overlap, dependencies, reuse, and cutover gates.
 - [Transport contract](docs/transport-contract.md) — identities, revisions, delivery, and durability semantics.
 - [Proof plan](docs/proof-plan.md) — functional and operational acceptance gates.
 

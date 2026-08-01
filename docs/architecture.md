@@ -45,13 +45,27 @@ The hook only requests a scan and returns. It must not synchronously upload tran
 
 ## Canonical and derived state
 
-The committed raw archive is the recovery boundary. It should contain ordinary, verbatim session files and enough metadata to associate each file with a stable record identity and source revision. Catalog databases, queued jobs, chunks, retrieval indexes, and learned memories are derived state.
+The committed raw archive is the recovery boundary. It consists of verbatim
+source revisions plus the durable identity/revision/commit metadata needed to
+interpret those bytes. In V1.5 the operator-provided mirror is the canonical
+current-byte source and Bookkeeper adds a durable observation ledger. In V2,
+Bookkeeper's committed objects and receipts are canonical together.
 
-Consumers read only committed generations and maintain their own cursors. A consumer failure must never block receipt of raw records or corrupt another consumer's progress.
+Raw projections, scan fingerprints, catalog indexes, queued jobs, retrieval
+indexes, and learned memories are rebuildable. Consumer cursors and delivery
+state are durable operational state: they may be replayed from the event ledger,
+but should survive ordinary restarts to prevent waste.
+
+Consumers read only committed archive events and maintain independent delivery
+state. A consumer failure must never block receipt of raw records or corrupt
+another consumer's progress.
 
 ## Stable record model
 
 A record is identified by an immutable producer identity plus an agent namespace and session identifier. A current path is an attribute, not an identity: a file move must not create a new session. A source revision identifies a specific byte representation, normally using a content hash and length. Deletion or retention expiry is represented as an explicit tombstone rather than silently erasing catalog history.
+
+See [the V1.5 design](v1.5-design.md) for the detailed domain model and
+[the evolution boundary](evolution-boundary.md) for the parts V2 reuses.
 
 ## Security and privacy posture
 
