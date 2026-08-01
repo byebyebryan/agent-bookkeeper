@@ -705,7 +705,7 @@ fn open_directory_no_follow(path: &Path) -> Result<File, SourceError> {
 }
 
 #[cfg(unix)]
-fn open_file_beneath(root: &Path, relative_path: &Path) -> Result<File, SourceError> {
+pub(crate) fn open_file_beneath(root: &Path, relative_path: &Path) -> Result<File, SourceError> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
 
@@ -755,7 +755,7 @@ fn open_directory_no_follow(_path: &Path) -> Result<File, SourceError> {
 }
 
 #[cfg(not(unix))]
-fn open_file_beneath(_root: &Path, _relative_path: &Path) -> Result<File, SourceError> {
+pub(crate) fn open_file_beneath(_root: &Path, _relative_path: &Path) -> Result<File, SourceError> {
     Err(SourceError::UnsupportedPlatform)
 }
 

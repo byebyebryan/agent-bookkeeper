@@ -15,8 +15,8 @@ Rust domain and durable SQLite event catalog, with fixtures for canonical
 revisions, path-independent identity, moves, rewrites, tombstones/restores, and
 multiple records per session. It also has a guarded read-only filesystem scanner
 with a versioned Codex rollout schema, durable scan state, and guarded
-tombstone grace. Source-byte delivery, integrity scrub, and real consumers
-remain pending. See
+tombstone grace. It also has held-descriptor validation for borrowed source
+bytes. Consumer queues, integrity scrub, and real consumers remain pending. See
 [implementation status](docs/implementation-status.md).
 
 V2's protocol is detailed but intentionally not frozen until the shared V1.5

@@ -7,6 +7,7 @@
 
 pub mod catalog;
 pub mod domain;
+pub mod payload;
 pub mod source_fs;
 
 pub use catalog::{
@@ -17,6 +18,7 @@ pub use domain::{
     ArchiveEvent, CanonicalRevision, DeliveryOutcome, DomainError, EventKind, LogicalLocation,
     ProducerId, RecordIdentity, RecordState,
 };
+pub use payload::{CurrentExternalRevision, PayloadError, VerifiedReader};
 pub use source_fs::{
     Blake3RevisionHasher, CodexRolloutLayout, DeletionMode, IdentitySchema, LayoutPlugin,
     ReconcileReport, Reconciler, RootGuard, SourceConfig, SourceError, SourceRoot, StabilityPolicy,
