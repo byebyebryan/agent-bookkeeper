@@ -820,10 +820,10 @@ fn append_tool_event_message(
             {
                 result_parts.push(output.to_owned());
             }
-            if let Some(exit_code) = payload.get("exit_code").and_then(Value::as_i64)
-                && exit_code != 0
-            {
-                result_parts.push(format!("exit_code: {exit_code}"));
+            if let Some(exit_code) = payload.get("exit_code").and_then(Value::as_i64) {
+                if exit_code != 0 {
+                    result_parts.push(format!("exit_code: {exit_code}"));
+                }
             }
             if let Some(status) = payload
                 .get("status")
