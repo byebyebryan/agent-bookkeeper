@@ -62,6 +62,18 @@ rewrite therefore follows the normal revision/event path, while a changing file
 is skipped until a later cycle. Fixtures cover same-size drift and a zero-budget
 resume boundary.
 
+## Implemented in progress: controlled-run measurements
+
+Reusable measurement helpers wrap ordinary reconciliation and integrity scrubs.
+They report elapsed time, bytes hashed, derived hash throughput, process user/
+system CPU deltas, and process high-water resident memory where the host
+provides it (Linux `ru_maxrss` is normalized to bytes). The memory value is a
+process-lifetime high-water, not a per-run allocation claim.
+
+The helper deliberately does not publish a benchmark headline. A deployment
+still needs to record its own representative seed, append/rewrite, scrub, and
+consumer-cohort envelopes under the selected limits and hardware.
+
 ## Implemented in progress: verified external payload reader
 
 `CurrentExternalRevision` resolves a configured root-relative file through a
@@ -129,14 +141,13 @@ revision, and event state.
 
 ## Remaining V1.5 slices
 
-1. Finish source operational proof: a resumable byte-budgeted integrity scrub,
-   scan/source health status, source-level resource limits, and representative
-   large-record measurements.
+1. Finish source operational proof: recorded representative large-record
+   measurements and source health/readiness integration for deployment.
 2. Finish payload and delivery: consumer policy (retry/backoff, filters, and
    explicit unavailable-revision policy), cross-process-safe cache reclamation,
    and a real adapter boundary.
-3. Operational proof: representative large-record measurements, cache crash
-   reclamation, retry/backoff policy, and a controlled evidence-consumer cohort.
+3. Operational proof: cache crash reclamation, retry/backoff policy, and a
+   controlled evidence-consumer cohort.
 
 ## Validation
 

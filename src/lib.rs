@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod controller;
 pub mod delivery;
 pub mod domain;
+pub mod measurement;
 pub mod payload;
 pub mod source_fs;
 
@@ -29,6 +30,10 @@ pub use delivery::{
 pub use domain::{
     ArchiveEvent, CanonicalRevision, DeliveryOutcome, DomainError, EventKind, LogicalLocation,
     ProducerId, RecordIdentity, RecordState,
+};
+pub use measurement::{
+    MeasurementError, ProcessResources, ReconcileMeasurement, ResourceDelta, ScrubMeasurement,
+    current_process_resources, measure_reconciliation, measure_scrub,
 };
 pub use payload::{
     CurrentExternalRevision, MaterializationCache, MaterializationLimits, MaterializedLease,
