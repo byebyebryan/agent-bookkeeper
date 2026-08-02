@@ -59,6 +59,7 @@ and rebuildable current projection.
 - [Transport contract](docs/transport-contract.md) — identities, revisions, delivery, and durability semantics.
 - [Proof plan](docs/proof-plan.md) — functional and operational acceptance gates.
 - [Implementation status](docs/implementation-status.md) — implemented slices and remaining proof work.
+- [V1.5 checkpoint audit](docs/v1.5-checkpoint-audit.md) — fixture-proven behavior and the next deployment cohort.
 
 ## Non-goals
 
