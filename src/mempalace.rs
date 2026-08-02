@@ -205,24 +205,59 @@ impl<R: MempalaceRunner> MempalaceConsumer<R> {
         }
 
         if let Some(revision) = payload_revision {
-            self.runner
-                .ingest(&MempalaceIngestRequest {
-                    input_path: payload.expect("payload matched a revision").to_owned(),
-                    source_id,
-                    subscription_id: delivery.subscription_id.as_uuid(),
-                    event_id: delivery.event_id.as_uuid(),
-                    event_sequence: delivery.event_sequence,
-                    record_id: delivery.record_id.as_uuid(),
-                    record_version: delivery.record_version,
-                    event_kind: delivery.kind,
-                    location: delivery.location.clone(),
-                    revision,
-                })
-                .map_err(MempalaceConsumerError::Runner)?;
+            let (input_path, temporary_alias) =
+                codex_stream_input_path(payload.expect("payload matched a revision"))?;
+            let result = self.runner.ingest(&MempalaceIngestRequest {
+                input_path,
+                source_id,
+                subscription_id: delivery.subscription_id.as_uuid(),
+                event_id: delivery.event_id.as_uuid(),
+                event_sequence: delivery.event_sequence,
+                record_id: delivery.record_id.as_uuid(),
+                record_version: delivery.record_version,
+                event_kind: delivery.kind,
+                location: delivery.location.clone(),
+                revision,
+            });
+            let cleanup = temporary_alias.map(fs::remove_file).transpose();
+            result.map_err(MempalaceConsumerError::Runner)?;
+            cleanup?;
         }
         write_receipt(&destination, &receipt)?;
         Ok(receipt_outcome(delivery))
     }
+}
+
+/// Return a path accepted by MemPalace's Codex importer.
+///
+/// Bookkeeper's cache intentionally uses an extension-neutral ``.payload``
+/// lease name. MemPalace correctly requires an explicit ``.jsonl`` source, so
+/// retain the verified lease bytes in place and expose a short-lived hard-link
+/// alias only for the child process. The alias is in the same cache directory,
+/// incurs no copy, and is removed whether that process succeeds or fails.
+fn codex_stream_input_path(payload: &Path) -> Result<(PathBuf, Option<PathBuf>), std::io::Error> {
+    if payload.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+        return Ok((payload.to_owned(), None));
+    }
+    let parent = payload.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "materialized payload has no parent directory",
+        )
+    })?;
+    let filename = payload.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "materialized payload has no filename",
+        )
+    })?;
+    let alias = parent.join(format!(
+        ".{}.{}.jsonl",
+        filename.to_string_lossy(),
+        Uuid::new_v4()
+    ));
+    fs::hard_link(payload, &alias)?;
+    Ok((alias.clone(), Some(alias)))
 }
 
 impl<R: MempalaceRunner> PathConsumer for MempalaceConsumer<R> {
@@ -445,6 +480,14 @@ mod tests {
         assert_eq!(request.revision, revision);
         assert!(request.input_path.starts_with(&cache_root));
         assert_ne!(request.input_path, source_path);
+        assert_eq!(
+            request
+                .input_path
+                .extension()
+                .and_then(|value| value.to_str()),
+            Some("jsonl")
+        );
+        assert!(!request.input_path.exists());
         assert_eq!(
             request.source_id,
             format!("agent-bookkeeper://record/{}", request.record_id)
