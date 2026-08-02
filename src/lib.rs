@@ -5,6 +5,7 @@
 //! ledger on which a guarded filesystem reconciler and consumer delivery layer
 //! can be built.
 
+pub mod admin;
 pub mod catalog;
 pub mod controller;
 pub mod delivery;
@@ -12,9 +13,10 @@ pub mod domain;
 pub mod payload;
 pub mod source_fs;
 
+pub use admin::{AdminError, CatalogStatus, SourceStatus, SubscriptionStatus, catalog_status};
 pub use catalog::{
-    Catalog, CatalogError, CurrentRecord, SourceFingerprint, SourceRegistration, SourceScan,
-    TombstoneGrace,
+    BackupArtifact, BackupMetadata, Catalog, CatalogError, CurrentRecord, SourceFingerprint,
+    SourceRegistration, SourceScan, TombstoneGrace,
 };
 pub use controller::{
     ControlledDeliveryAttempt, ControlledDeliveryOutcome, ControlledRunLimits, ControlledRunReport,

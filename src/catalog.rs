@@ -1,8 +1,11 @@
-use std::fs::Metadata;
-use std::path::Path;
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, MAIN_DB, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -86,6 +89,25 @@ pub struct SourceFingerprint {
     modified_nanoseconds: u32,
     device: Option<u64>,
     inode: Option<u64>,
+}
+
+/// Metadata bound to the SQLite-aware backup artifact set. The caller supplies
+/// the digest of its reviewed source configuration because roots and guards are
+/// deployment-owned rather than catalog rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackupMetadata {
+    pub format_version: u32,
+    pub created_at_ms: i64,
+    pub schema_version: i64,
+    pub latest_event_sequence: u64,
+    pub source_configuration_digest: [u8; blake3::OUT_LEN],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackupArtifact {
+    pub catalog_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub metadata: BackupMetadata,
 }
 
 impl SourceFingerprint {
@@ -178,6 +200,8 @@ pub struct CurrentRecord {
 pub enum CatalogError {
     #[error(transparent)]
     Domain(#[from] DomainError),
+    #[error("filesystem error: {0}")]
+    Io(#[from] io::Error),
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("catalog schema version {found} is newer than this binary supports ({supported})")]
@@ -194,6 +218,18 @@ pub enum CatalogError {
     InvalidTombstoneGrace(String),
     #[error("source scan is stale or not active: {0}")]
     SourceScanConflict(String),
+    #[error("invalid backup destination: {0}")]
+    InvalidBackupDestination(String),
+    #[error("backup destination already exists: {0}")]
+    BackupDestinationExists(PathBuf),
+    #[error("backup manifest is invalid: {0}")]
+    BackupManifestInvalid(String),
+    #[error("backup manifest does not match its SQLite artifact")]
+    BackupManifestMismatch,
+    #[error(
+        "backup source configuration digest does not match the expected deployment configuration"
+    )]
+    BackupSourceConfigurationMismatch,
 }
 
 impl Catalog {
@@ -219,6 +255,134 @@ impl Catalog {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    pub fn latest_event_sequence(&self) -> Result<u64, CatalogError> {
+        let sequence: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM events",
+            [],
+            |row| row.get(0),
+        )?;
+        as_u64(sequence, "latest event sequence")
+    }
+
+    /// Creates a consistent SQLite backup and an adjacent manifest. The target
+    /// paths must be new: a backup rotation chooses a new destination rather
+    /// than overwriting the last known-good recovery set.
+    pub fn backup_to(
+        &self,
+        destination: impl AsRef<Path>,
+        source_configuration_digest: [u8; blake3::OUT_LEN],
+        created_at_ms: i64,
+    ) -> Result<BackupArtifact, CatalogError> {
+        let destination = validate_backup_destination(destination.as_ref())?;
+        let manifest_path = backup_manifest_path(&destination)?;
+        if destination.exists() || manifest_path.exists() {
+            return Err(CatalogError::BackupDestinationExists(destination));
+        }
+        let metadata = BackupMetadata {
+            format_version: 1,
+            created_at_ms,
+            schema_version: self.schema_version()?,
+            latest_event_sequence: self.latest_event_sequence()?,
+            source_configuration_digest,
+        };
+        let temporary_catalog = temporary_backup_path(&destination, "catalog")?;
+        let temporary_manifest = temporary_backup_path(&manifest_path, "manifest")?;
+        let result = (|| -> Result<(), CatalogError> {
+            self.connection.backup(MAIN_DB, &temporary_catalog, None)?;
+            File::open(&temporary_catalog)?.sync_all()?;
+            write_backup_manifest(&temporary_manifest, &metadata)?;
+            fs::rename(&temporary_catalog, &destination)?;
+            sync_parent_directory(&destination)?;
+            fs::rename(&temporary_manifest, &manifest_path)?;
+            sync_parent_directory(&manifest_path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary_catalog);
+            let _ = fs::remove_file(&temporary_manifest);
+        }
+        result?;
+        Ok(BackupArtifact {
+            catalog_path: destination,
+            manifest_path,
+            metadata,
+        })
+    }
+
+    /// Validates the adjacent manifest and its relation to the read-only
+    /// SQLite artifact before an operator restores it.
+    pub fn validate_backup(
+        artifact: impl AsRef<Path>,
+        expected_source_configuration_digest: [u8; blake3::OUT_LEN],
+    ) -> Result<BackupArtifact, CatalogError> {
+        let catalog_path = validate_backup_destination(artifact.as_ref())?;
+        let manifest_path = backup_manifest_path(&catalog_path)?;
+        let metadata = read_backup_manifest(&manifest_path)?;
+        if metadata.source_configuration_digest != expected_source_configuration_digest {
+            return Err(CatalogError::BackupSourceConfigurationMismatch);
+        }
+        let connection = Connection::open_with_flags(
+            &catalog_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let found_schema: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        let latest_event: i64 =
+            connection.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |row| {
+                row.get(0)
+            })?;
+        if metadata.schema_version != found_schema
+            || metadata.latest_event_sequence != as_u64(latest_event, "backup event sequence")?
+        {
+            return Err(CatalogError::BackupManifestMismatch);
+        }
+        Ok(BackupArtifact {
+            catalog_path,
+            manifest_path,
+            metadata,
+        })
+    }
+
+    /// Restores an already validated SQLite backup to a new control-database
+    /// path using SQLite's backup API. It never overwrites a live destination.
+    pub fn restore_backup_to(
+        artifact: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        expected_source_configuration_digest: [u8; blake3::OUT_LEN],
+    ) -> Result<BackupArtifact, CatalogError> {
+        let artifact = Self::validate_backup(artifact, expected_source_configuration_digest)?;
+        let destination = validate_backup_destination(destination.as_ref())?;
+        let manifest_path = backup_manifest_path(&destination)?;
+        if destination.exists() || manifest_path.exists() {
+            return Err(CatalogError::BackupDestinationExists(destination));
+        }
+        let temporary_catalog = temporary_backup_path(&destination, "restore")?;
+        let temporary_manifest = temporary_backup_path(&manifest_path, "restore-manifest")?;
+        let result = (|| -> Result<(), CatalogError> {
+            let source = Connection::open_with_flags(
+                &artifact.catalog_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            source.backup(MAIN_DB, &temporary_catalog, None)?;
+            File::open(&temporary_catalog)?.sync_all()?;
+            write_backup_manifest(&temporary_manifest, &artifact.metadata)?;
+            fs::rename(&temporary_catalog, &destination)?;
+            sync_parent_directory(&destination)?;
+            fs::rename(&temporary_manifest, &manifest_path)?;
+            sync_parent_directory(&manifest_path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary_catalog);
+            let _ = fs::remove_file(&temporary_manifest);
+        }
+        result?;
+        Self::validate_backup(destination, expected_source_configuration_digest)
     }
 
     /// Begins a source generation after the filesystem adapter's initial root
@@ -1266,6 +1430,175 @@ fn now_ms() -> Result<i64, CatalogError> {
         .map_err(|_| CatalogError::Corrupt("Unix timestamp exceeds i64 milliseconds".to_owned()))
 }
 
+fn validate_backup_destination(path: &Path) -> Result<PathBuf, CatalogError> {
+    if !path.is_absolute() {
+        return Err(CatalogError::InvalidBackupDestination(
+            "backup destination must be an absolute path".to_owned(),
+        ));
+    }
+    let Some(parent) = path.parent() else {
+        return Err(CatalogError::InvalidBackupDestination(
+            "backup destination must have a parent directory".to_owned(),
+        ));
+    };
+    let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(CatalogError::InvalidBackupDestination(
+            "backup destination filename must be UTF-8".to_owned(),
+        ));
+    };
+    if filename.is_empty() {
+        return Err(CatalogError::InvalidBackupDestination(
+            "backup destination filename must not be empty".to_owned(),
+        ));
+    }
+    let metadata = fs::symlink_metadata(parent)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(CatalogError::InvalidBackupDestination(
+            "backup destination parent must be a real directory".to_owned(),
+        ));
+    }
+    Ok(path.to_owned())
+}
+
+fn backup_manifest_path(catalog_path: &Path) -> Result<PathBuf, CatalogError> {
+    let parent = catalog_path.parent().ok_or_else(|| {
+        CatalogError::InvalidBackupDestination(
+            "backup artifact must have a parent directory".to_owned(),
+        )
+    })?;
+    let filename = catalog_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            CatalogError::InvalidBackupDestination(
+                "backup artifact filename must be UTF-8".to_owned(),
+            )
+        })?;
+    Ok(parent.join(format!("{filename}.metadata.json")))
+}
+
+fn temporary_backup_path(destination: &Path, label: &str) -> Result<PathBuf, CatalogError> {
+    let parent = destination.parent().ok_or_else(|| {
+        CatalogError::InvalidBackupDestination(
+            "backup artifact must have a parent directory".to_owned(),
+        )
+    })?;
+    let filename = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            CatalogError::InvalidBackupDestination(
+                "backup artifact filename must be UTF-8".to_owned(),
+            )
+        })?;
+    Ok(parent.join(format!(".{filename}.{label}-{}.partial", Uuid::new_v4())))
+}
+
+fn write_backup_manifest(path: &Path, metadata: &BackupMetadata) -> Result<(), CatalogError> {
+    let contents = format!(
+        concat!(
+            "{{\"format_version\":{},\"created_at_ms\":{},\"schema_version\":{},",
+            "\"latest_event_sequence\":{},\"source_configuration_digest\":\"{}\"}}\n"
+        ),
+        metadata.format_version,
+        metadata.created_at_ms,
+        metadata.schema_version,
+        metadata.latest_event_sequence,
+        hex_encode(&metadata.source_configuration_digest),
+    );
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn read_backup_manifest(path: &Path) -> Result<BackupMetadata, CatalogError> {
+    let contents = fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&contents)
+        .map_err(|error| CatalogError::BackupManifestInvalid(error.to_string()))?;
+    let object = value.as_object().ok_or_else(|| {
+        CatalogError::BackupManifestInvalid("manifest must be a JSON object".to_owned())
+    })?;
+    let format_version = object
+        .get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            CatalogError::BackupManifestInvalid("manifest format_version is missing".to_owned())
+        })?;
+    let created_at_ms = object
+        .get("created_at_ms")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            CatalogError::BackupManifestInvalid("manifest created_at_ms is missing".to_owned())
+        })?;
+    let schema_version = object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            CatalogError::BackupManifestInvalid("manifest schema_version is missing".to_owned())
+        })?;
+    let latest_event_sequence = object
+        .get("latest_event_sequence")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            CatalogError::BackupManifestInvalid(
+                "manifest latest_event_sequence is missing".to_owned(),
+            )
+        })?;
+    let source_configuration_digest = object
+        .get("source_configuration_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CatalogError::BackupManifestInvalid(
+                "manifest source_configuration_digest is missing".to_owned(),
+            )
+        })?;
+    if format_version != 1 {
+        return Err(CatalogError::BackupManifestInvalid(format!(
+            "unsupported backup manifest version {format_version}"
+        )));
+    }
+    Ok(BackupMetadata {
+        format_version: u32::try_from(format_version).map_err(|_| {
+            CatalogError::BackupManifestInvalid("manifest format_version exceeds u32".to_owned())
+        })?,
+        created_at_ms,
+        schema_version,
+        latest_event_sequence,
+        source_configuration_digest: hex_decode_32(source_configuration_digest)?,
+    })
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), CatalogError> {
+    let parent = path.parent().ok_or_else(|| {
+        CatalogError::InvalidBackupDestination(
+            "backup artifact must have a parent directory".to_owned(),
+        )
+    })?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_decode_32(value: &str) -> Result<[u8; blake3::OUT_LEN], CatalogError> {
+    if value.len() != blake3::OUT_LEN * 2 {
+        return Err(CatalogError::BackupManifestInvalid(
+            "manifest digest has the wrong length".to_owned(),
+        ));
+    }
+    let mut bytes = [0_u8; blake3::OUT_LEN];
+    for (index, output) in bytes.iter_mut().enumerate() {
+        let start = index * 2;
+        *output = u8::from_str_radix(&value[start..start + 2], 16).map_err(|_| {
+            CatalogError::BackupManifestInvalid("manifest digest is not hexadecimal".to_owned())
+        })?;
+    }
+    Ok(bytes)
+}
+
 fn unix_time_parts(time: SystemTime) -> (i64, u32) {
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => (
@@ -1335,6 +1668,7 @@ fn to_sql_conversion_error(error: CatalogError) -> rusqlite::Error {
 mod tests {
     use super::Catalog;
     use super::{SourceRegistration, TombstoneGrace};
+    use crate::delivery::{SubscriptionConfig, SubscriptionMode};
     use crate::domain::{
         CanonicalRevision, EventKind, LogicalLocation, ProducerId, RecordIdentity, RecordState,
     };
@@ -1493,6 +1827,66 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].sequence, 1);
         assert_eq!(current.revision, Some(revision));
+    }
+
+    #[test]
+    fn sqlite_aware_backup_and_restore_preserve_delivery_state() {
+        let directory = tempdir().unwrap();
+        let live_path = directory.path().join("live.sqlite3");
+        let backup_path = directory.path().join("backup.sqlite3");
+        let restored_path = directory.path().join("restored.sqlite3");
+        let source_configuration_digest = [42_u8; blake3::OUT_LEN];
+        let identity = identity();
+        let revision = CanonicalRevision::from_bytes(b"durable backup\n");
+        let subscription;
+
+        {
+            let mut catalog = Catalog::open(&live_path).unwrap();
+            subscription = catalog
+                .create_subscription(
+                    SubscriptionConfig::new("backup-fixture", 1, true, true).unwrap(),
+                    SubscriptionMode::ReplayEvents,
+                    0,
+                )
+                .unwrap();
+            catalog
+                .observe_present_at(&identity, &location("sessions/a.jsonl"), revision, 100)
+                .unwrap();
+            catalog
+                .lease_next(subscription.id, 110, 100)
+                .unwrap()
+                .unwrap();
+
+            let artifact = catalog
+                .backup_to(&backup_path, source_configuration_digest, 120)
+                .unwrap();
+            assert!(artifact.catalog_path.exists());
+            assert!(artifact.manifest_path.exists());
+            assert_eq!(artifact.metadata.latest_event_sequence, 1);
+        }
+
+        assert!(matches!(
+            Catalog::validate_backup(&backup_path, [0_u8; blake3::OUT_LEN]),
+            Err(super::CatalogError::BackupSourceConfigurationMismatch)
+        ));
+        let restored =
+            Catalog::restore_backup_to(&backup_path, &restored_path, source_configuration_digest)
+                .unwrap();
+        assert_eq!(restored.catalog_path, restored_path);
+        assert!(restored.manifest_path.exists());
+
+        let restored_catalog = Catalog::open(&restored_path).unwrap();
+        assert_eq!(restored_catalog.events_after(0).unwrap().len(), 1);
+        assert_eq!(
+            restored_catalog
+                .current_record(&identity)
+                .unwrap()
+                .unwrap()
+                .revision,
+            Some(revision)
+        );
+        let counts = restored_catalog.delivery_counts(subscription.id).unwrap();
+        assert_eq!(counts.leased, 1);
     }
 
     #[test]

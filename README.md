@@ -20,7 +20,9 @@ subscription/lease ledger that preserves per-record version ordering. A bounded
 path-consumer proof harness creates verified lease-scoped copies instead of
 exposing mutable source paths, and demonstrates idempotent redelivery with a
 fake adapter. Integrity scrub, cache operational closure, and real consumers
-remain pending. See [implementation status](docs/implementation-status.md).
+remain pending. The current library also exposes content-free catalog status and
+SQLite-aware backup/validation/restore helpers for the durable control ledger.
+See [implementation status](docs/implementation-status.md).
 
 V2's protocol is detailed but intentionally not frozen until the shared V1.5
 domain model passes its gates. The plan is staged:

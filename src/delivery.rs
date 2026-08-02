@@ -20,7 +20,7 @@ impl SubscriptionId {
         Self(Uuid::new_v4())
     }
 
-    fn from_uuid(value: Uuid) -> Self {
+    pub(crate) fn from_uuid(value: Uuid) -> Self {
         Self(value)
     }
 
@@ -59,6 +59,16 @@ impl SubscriptionMode {
         match self {
             Self::ReplayEvents => "replay_events",
             Self::RebuildCurrent => "rebuild_current",
+        }
+    }
+
+    pub(crate) fn from_db(value: &str) -> Result<Self, DeliveryError> {
+        match value {
+            "replay_events" => Ok(Self::ReplayEvents),
+            "rebuild_current" => Ok(Self::RebuildCurrent),
+            _ => Err(DeliveryError::Corrupt(format!(
+                "unknown subscription mode {value:?}"
+            ))),
         }
     }
 }
@@ -145,7 +155,7 @@ impl DeliveryState {
         }
     }
 
-    fn from_db(value: &str) -> Result<Self, DeliveryError> {
+    pub(crate) fn from_db(value: &str) -> Result<Self, DeliveryError> {
         match value {
             "queued" => Ok(Self::Queued),
             "leased" => Ok(Self::Leased),

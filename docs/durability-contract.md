@@ -29,6 +29,14 @@ SQLite-aware snapshot operation. Copying live database and WAL files separately
 is not a supported backup method. A backup artifact records schema version,
 latest event sequence, source configuration digest, and creation time.
 
+The reference library writes a recovery set to new paths only: a consistent
+SQLite artifact and an adjacent JSON manifest. The caller supplies the digest
+of its reviewed deployment source configuration because mounted roots and root
+guards are deployment configuration rather than catalog rows. Validation opens
+the SQLite artifact read-only and compares its schema/event boundary with the
+manifest before restore. Restore is SQLite-aware and writes only to a new
+destination; it never overwrites a live control database.
+
 A restore proof must demonstrate preserved identities, record versions, event
 order, tombstones, subscription state, and outstanding delivery outcomes.
 

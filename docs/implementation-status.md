@@ -93,6 +93,21 @@ active entry/byte admission limits, but not yet cross-process reclamation or a
 reusable shared-entry index. The controller is a proof harness, not a daemon,
 schedule, or real archive adapter.
 
+## Implemented in progress: status and recovery-set proof
+
+The library exposes a content-free catalog status snapshot with archive event
+position, active/tombstoned record counts, revisions, per-source scan progress,
+tombstone candidates, and per-subscription delivery/age/acknowledgement state.
+
+It also creates SQLite-online-backup recovery sets rather than copying a live
+database and WAL independently. A set consists of a new SQLite artifact plus a
+durably written adjacent manifest containing the schema version, latest event
+sequence, creation time, and a caller-supplied digest of the reviewed deployment
+source configuration. Validation compares manifest and read-only SQLite state;
+restore validates first and writes only to a new destination. The automated
+restore fixture preserves an outstanding leased delivery as well as identity,
+revision, and event state.
+
 ## Remaining V1.5 slices
 
 1. Finish source operational proof: a resumable byte-budgeted integrity scrub,
@@ -101,8 +116,8 @@ schedule, or real archive adapter.
 2. Finish payload and delivery: consumer policy (retry/backoff, filters, and
    explicit unavailable-revision policy), cross-process-safe cache reclamation,
    and a real adapter boundary.
-3. Operational proof: status, SQLite-aware backup/restore, source and consumer
-   resource controls, representative large-record measurements, and a
+3. Operational proof: resumable integrity scrub, source resource controls,
+   representative large-record measurements, cache crash reclamation, and a
    controlled evidence-consumer cohort.
 
 ## Validation
