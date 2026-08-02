@@ -119,10 +119,11 @@ controlled-run helper rather than a background mining worker:
 - an idempotent fake adapter proves a durable external effect is not duplicated
   when the acknowledgement is lost and the same event is redelivered.
 
-The cache is derived, process-owned controller state. It has per-entry and
-active entry/byte admission limits, but not yet cross-process reclamation or a
-reusable shared-entry index. The controller is a proof harness, not a daemon,
-schedule, or real archive adapter.
+The cache is derived controller state. It has per-entry and active entry/byte
+admission limits, holds an exclusive advisory owner lock, and reclaims only its
+recognized lease/partial filenames at next controlled startup. It does not yet
+have a reusable shared-entry index. The controller is a proof harness, not a
+daemon, schedule, or real archive adapter.
 
 ## Implemented in progress: status and recovery-set proof
 

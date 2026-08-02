@@ -229,10 +229,18 @@ plus later receipts before cutover is accepted.
 
 ## Materialization cache recovery
 
-Cache entries are keyed by canonical revision digest and contain a completed
-marker written only after length/digest verification and atomic rename. Startup
-deletes incomplete temporary files. Completed unleased entries may be evicted at
-any time under the byte/age policy.
+Cache entries are published only after complete length/digest verification and
+an atomic rename. V2 reusable entries are keyed by canonical revision digest and
+carry a completed marker; V1.5 uses a digest-plus-lease-nonce name for a
+distinct lease-scoped file. Startup deletes incomplete temporary files.
+Completed unleased entries may be evicted at any time under the byte/age policy.
+
+The V1.5 reference cache uses an exclusive advisory owner lock for its
+controller process. Once it owns the cache directory, startup reclaims only
+files matching its generated digest-plus-lease-nonce payload or partial names;
+unrecognized files are left untouched. The implementation's distinct
+lease-scoped payload files are removed at lease release, and any remaining
+recognized files are crash leftovers rather than archive evidence.
 
 Consumers never infer archive eligibility by scanning the cache or current
 projection. They receive an exact leased locator from `RevisionReader` after the

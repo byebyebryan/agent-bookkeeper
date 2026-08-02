@@ -135,7 +135,14 @@ pub struct MaterializationCache {
     root: PathBuf,
     limits: MaterializationLimits,
     state: Arc<Mutex<MaterializationState>>,
+    _lock: Arc<CacheLock>,
 }
+
+#[cfg(unix)]
+type CacheLock = File;
+
+#[cfg(not(unix))]
+type CacheLock = ();
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MaterializationState {
@@ -161,10 +168,13 @@ impl MaterializationCache {
                 "materialization cache root must be a real directory".to_owned(),
             ));
         }
+        let cache_lock = acquire_cache_lock(&root)?;
+        reclaim_orphaned_materializations(&root)?;
         Ok(Self {
             root,
             limits,
             state: Arc::new(Mutex::new(MaterializationState::default())),
+            _lock: Arc::new(cache_lock),
         })
     }
 
@@ -329,6 +339,90 @@ fn release_reservation(state: &Arc<Mutex<MaterializationState>>, bytes: u64) {
     }
 }
 
+#[cfg(unix)]
+fn acquire_cache_lock(root: &std::path::Path) -> Result<CacheLock, PayloadError> {
+    use std::os::fd::AsRawFd;
+
+    let lock_path = root.join(".agent-bookkeeper-materialization.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(PayloadError::CacheIo)?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Err(PayloadError::CacheLocked);
+        }
+        return Err(PayloadError::CacheIo(error));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn acquire_cache_lock(_root: &std::path::Path) -> Result<CacheLock, PayloadError> {
+    Ok(())
+}
+
+fn reclaim_orphaned_materializations(root: &std::path::Path) -> Result<(), PayloadError> {
+    let mut removed_any = false;
+    for entry in fs::read_dir(root).map_err(PayloadError::CacheIo)? {
+        let entry = entry.map_err(PayloadError::CacheIo)?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !is_owned_materialization_name(file_name) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(PayloadError::CacheIo)?;
+        if metadata.is_file() || metadata.file_type().is_symlink() {
+            fs::remove_file(entry.path()).map_err(PayloadError::CacheIo)?;
+            removed_any = true;
+        }
+    }
+    if removed_any {
+        File::open(root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(PayloadError::CacheIo)?;
+    }
+    Ok(())
+}
+
+fn is_owned_materialization_name(file_name: &str) -> bool {
+    let (name, suffix) = if let Some(name) = file_name.strip_suffix(".payload") {
+        (name, "payload")
+    } else if let Some(name) = file_name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".partial"))
+    {
+        (name, "partial")
+    } else {
+        return false;
+    };
+    if suffix != "payload" && suffix != "partial" {
+        return false;
+    }
+    let Some(rest) = name.strip_prefix("lease-") else {
+        return false;
+    };
+    let Some((digest, nonce)) = rest
+        .get(..blake3::OUT_LEN * 2)
+        .zip(rest.get(blake3::OUT_LEN * 2..))
+    else {
+        return false;
+    };
+    let Some(nonce) = nonce.strip_prefix('-') else {
+        return false;
+    };
+    digest.len() == blake3::OUT_LEN * 2
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && uuid::Uuid::parse_str(nonce).is_ok()
+}
+
 /// A reader over one held, no-follow descriptor. The consumer may stream its
 /// contents normally, but must call [`VerifiedReader::finish`] before it treats
 /// the payload as successfully delivered.
@@ -404,6 +498,8 @@ pub enum PayloadError {
     CacheIo(#[source] io::Error),
     #[error("materialization cache accounting lock was poisoned")]
     CachePoisoned,
+    #[error("materialization cache is already owned by another controller process")]
+    CacheLocked,
     #[error(
         "revision of {requested_bytes} bytes exceeds the materialization per-entry limit of {limit_bytes} bytes"
     )]
@@ -570,5 +666,48 @@ mod tests {
 
         fs::write(&source_path, b"original\n").unwrap();
         cache.materialize(&external).unwrap().release().unwrap();
+    }
+
+    #[test]
+    fn cache_startup_reclaims_only_recognized_orphaned_materializations() {
+        let directory = tempdir().unwrap();
+        let cache_root = directory.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+        let orphan = cache_root.join(format!(
+            "lease-{}-{}.payload",
+            "a".repeat(blake3::OUT_LEN * 2),
+            uuid::Uuid::new_v4()
+        ));
+        let partial = cache_root.join(format!(
+            ".lease-{}-{}.partial",
+            "b".repeat(blake3::OUT_LEN * 2),
+            uuid::Uuid::new_v4()
+        ));
+        let unrelated = cache_root.join("operator-note.txt");
+        fs::write(&orphan, b"orphan").unwrap();
+        fs::write(&partial, b"partial").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+
+        let _cache =
+            MaterializationCache::new(&cache_root, MaterializationLimits::new(64, 1, 64).unwrap())
+                .unwrap();
+
+        assert!(!orphan.exists());
+        assert!(!partial.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_refuses_a_second_controller_owner() {
+        let directory = tempdir().unwrap();
+        let cache_root = directory.path().join("cache");
+        let limits = MaterializationLimits::new(64, 1, 64).unwrap();
+        let _first = MaterializationCache::new(&cache_root, limits).unwrap();
+
+        assert!(matches!(
+            MaterializationCache::new(&cache_root, limits),
+            Err(PayloadError::CacheLocked)
+        ));
     }
 }

@@ -24,7 +24,8 @@ SQLite-aware backup/validation/restore helpers for the durable control ledger.
 It includes an explicit byte-budgeted integrity scrub with a durable cursor, so
 steady scans can stay metadata-only while unchanged records are still rehashed
 over time, plus measurement helpers for elapsed/CPU/memory/throughput evidence.
-Cache operational closure and real consumers remain pending.
+The materialization cache uses an exclusive controller lock and reclaims
+recognized crash leftovers. Real consumers remain pending.
 See [implementation status](docs/implementation-status.md).
 
 V2's protocol is detailed but intentionally not frozen until the shared V1.5
