@@ -3,6 +3,7 @@
 # Build the generic V1.5 one-shot controller, then layer it onto an
 # operator-provided MemPalace image. The operator pins both inputs and supplies
 # all paths, storage, and runtime configuration through Compose or equivalent.
+ARG MEMPALACE_IMAGE=mempalace:latest
 FROM rust:1.85-slim AS bookkeeper-builder
 
 RUN apt-get update \
@@ -13,7 +14,6 @@ WORKDIR /src
 COPY . /src
 RUN cargo build --release --bin agent-bookkeeper-mempalace-controller
 
-ARG MEMPALACE_IMAGE=mempalace:latest
 FROM ${MEMPALACE_IMAGE}
 
 USER root
