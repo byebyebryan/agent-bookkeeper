@@ -25,7 +25,10 @@ It includes an explicit byte-budgeted integrity scrub with a durable cursor, so
 steady scans can stay metadata-only while unchanged records are still rehashed
 over time, plus measurement helpers for elapsed/CPU/memory/throughput evidence.
 The materialization cache uses an exclusive controller lock and reclaims
-recognized crash leftovers. Real consumers remain pending.
+recognized crash leftovers. A controlled MemPalace CLI adapter now passes only
+verified lease-scoped paths, provides a stable Bookkeeper record source ID, and
+writes durable provenance receipts. It is ready for a bounded operator cohort,
+not a standing worker or a general promotion claim.
 See [implementation status](docs/implementation-status.md).
 
 V2's protocol is detailed but intentionally not frozen until the shared V1.5

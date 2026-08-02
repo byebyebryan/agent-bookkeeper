@@ -83,6 +83,24 @@ event. Reapplying the same event validates the existing manifest rather than
 creating a duplicate derived effect. It is a local proof adapter, not a
 replacement for a search or learned-memory consumer.
 
+## Implemented in progress: MemPalace controlled-cohort adapter
+
+`MempalaceConsumer` is a concrete, command-runner-backed evidence adapter for
+Codex JSONL. It verifies the lease-scoped materialization against the canonical
+BLAKE3 revision before invoking `mempalace --palace <path> codex-stream`. It
+uses a stable `agent-bookkeeper://record/<record-id>` source ID, so an ephemeral
+materialization cache filename never becomes search provenance or an index
+identity. A durable receipt records the subscription/event idempotency key,
+logical source location, canonical revision, and source ID only after the
+command succeeds; a lost Bookkeeper acknowledgement can therefore be retried
+without a second consumer effect.
+
+The streaming importer does not yet expose a record-delete operation. A
+metadata-only tombstone is durably `ignored_by_policy`, not falsely reported as
+removed from an existing semantic index. The first deployed cohort keeps
+source-deletion inference disabled and treats this as an explicit later policy
+decision.
+
 ## Implemented in progress: verified external payload reader
 
 `CurrentExternalRevision` resolves a configured root-relative file through a
@@ -166,9 +184,10 @@ revision, and event state.
 
 1. Finish source operational proof: recorded representative large-record
    measurements and source health/readiness integration for deployment.
-2. Finish payload and delivery: consumer filters, explicit unavailable-revision
-   policy, and a real adapter boundary.
-3. Operational proof: a controlled evidence-consumer cohort.
+2. Finish payload and delivery: consumer filters and explicit
+   unavailable-revision policy.
+3. Operational proof: a bounded MemPalace consumer cohort with provenance and
+   retrieval acceptance evidence.
 
 ## Validation
 

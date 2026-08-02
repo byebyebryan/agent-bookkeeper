@@ -12,6 +12,7 @@ pub mod delivery;
 pub mod domain;
 pub mod evidence;
 pub mod measurement;
+pub mod mempalace;
 pub mod payload;
 pub mod source_fs;
 
@@ -36,6 +37,10 @@ pub use evidence::{EvidenceConsumerError, FilesystemEvidenceConsumer};
 pub use measurement::{
     MeasurementError, ProcessResources, ReconcileMeasurement, ResourceDelta, ScrubMeasurement,
     current_process_resources, measure_reconciliation, measure_scrub,
+};
+pub use mempalace::{
+    MempalaceCliConfig, MempalaceCommandRunner, MempalaceConsumer, MempalaceConsumerError,
+    MempalaceIngestRequest, MempalaceRunner,
 };
 pub use payload::{
     CurrentExternalRevision, MaterializationCache, MaterializationLimits, MaterializedLease,
