@@ -71,6 +71,13 @@ pub struct ControlledRunLimits {
     max_deliveries: u32,
     max_payload_bytes: u64,
     lease_duration_ms: u64,
+    unavailable_payload_policy: UnavailablePayloadPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnavailablePayloadPolicy {
+    Retry,
+    Block,
 }
 
 impl ControlledRunLimits {
@@ -89,7 +96,13 @@ impl ControlledRunLimits {
             max_deliveries,
             max_payload_bytes,
             lease_duration_ms,
+            unavailable_payload_policy: UnavailablePayloadPolicy::Retry,
         })
+    }
+
+    pub fn with_unavailable_payload_policy(mut self, policy: UnavailablePayloadPolicy) -> Self {
+        self.unavailable_payload_policy = policy;
+        self
     }
 }
 
@@ -108,6 +121,7 @@ pub trait PathConsumer {
 pub enum ControlledDeliveryOutcome {
     Settled(DeliveryOutcome),
     Retried { reason: String },
+    Blocked { reason: String },
     DeferredByByteBudget,
 }
 
@@ -189,13 +203,23 @@ pub fn run_path_consumer<C: PathConsumer>(
             let materialized = match cache.materialize(&external) {
                 Ok(lease) => lease,
                 Err(error) => {
-                    catalog.retry_delivery(&delivery, now_ms)?;
-                    report.attempts.push(attempt(
-                        &delivery,
-                        ControlledDeliveryOutcome::Retried {
-                            reason: format!("verified materialization failed: {error}"),
-                        },
-                    ));
+                    let reason = format!("verified materialization failed: {error}");
+                    match limits.unavailable_payload_policy {
+                        UnavailablePayloadPolicy::Retry => {
+                            catalog.retry_delivery(&delivery, now_ms)?;
+                            report.attempts.push(attempt(
+                                &delivery,
+                                ControlledDeliveryOutcome::Retried { reason },
+                            ));
+                        }
+                        UnavailablePayloadPolicy::Block => {
+                            catalog.block_delivery(&delivery, now_ms, &reason)?;
+                            report.attempts.push(attempt(
+                                &delivery,
+                                ControlledDeliveryOutcome::Blocked { reason },
+                            ));
+                        }
+                    }
                     break;
                 }
             };

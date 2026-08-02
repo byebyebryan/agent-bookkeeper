@@ -549,6 +549,39 @@ impl Catalog {
         Ok(())
     }
 
+    /// Conservatively pauses one leased delivery when its required payload is
+    /// unavailable. Unlike a dead letter, this remains an unresolved ordering
+    /// barrier until an operator deliberately requeues it or changes policy.
+    pub fn block_delivery(
+        &mut self,
+        lease: &DeliveryLease,
+        now_ms: i64,
+        reason: &str,
+    ) -> Result<(), DeliveryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE deliveries
+             SET state = 'blocked', lease_token = NULL, lease_expires_at_ms = NULL,
+                 settled_at_ms = NULL, settlement_reason = ?1
+             WHERE id = ?2 AND subscription_id = ?3 AND state = 'leased'
+               AND lease_token = ?4 AND lease_expires_at_ms > ?5",
+            params![
+                reason,
+                as_i64(lease.delivery_id, "delivery ID")?,
+                lease.subscription_id.as_uuid().as_bytes(),
+                lease.token.as_uuid().as_bytes(),
+                now_ms,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DeliveryError::StaleLease);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn delivery_counts(
         &self,
         subscription_id: SubscriptionId,

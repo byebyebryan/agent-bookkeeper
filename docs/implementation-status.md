@@ -133,6 +133,11 @@ identity, becomes leaseable only after the capped exponential delay, and
 transitions to a durable dead letter once the configured attempt limit is
 reached. Dead letters retain their existing per-record ordering-barrier behavior.
 
+For mutable V1.5 source bytes, a controlled path run now selects either retry
+or a conservative durable `blocked` outcome when verification fails. Blocking
+is an explicit non-success and retains the ordering barrier; automatic
+supersession and metadata-only adapters remain later consumer-policy work.
+
 ## Implemented in progress: status and recovery-set proof
 
 The library exposes a content-free catalog status snapshot with archive event

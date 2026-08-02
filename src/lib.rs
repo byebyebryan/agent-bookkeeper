@@ -21,7 +21,7 @@ pub use catalog::{
 };
 pub use controller::{
     ControlledDeliveryAttempt, ControlledDeliveryOutcome, ControlledRunLimits, ControlledRunReport,
-    ControllerError, DeliveryRoots, PathConsumer, run_path_consumer,
+    ControllerError, DeliveryRoots, PathConsumer, UnavailablePayloadPolicy, run_path_consumer,
 };
 pub use delivery::{
     DeliveryCounts, DeliveryError, DeliveryLease, DeliveryState, LeaseToken, RetryPolicy,
