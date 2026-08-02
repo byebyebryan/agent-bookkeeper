@@ -308,6 +308,7 @@ pub struct ArchiveEvent {
     pub record_version: u64,
     pub kind: EventKind,
     pub revision_id: Option<RevisionId>,
+    pub location: Option<LogicalLocation>,
     pub committed_at_ms: i64,
 }
 

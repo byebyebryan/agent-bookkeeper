@@ -6,6 +6,7 @@
 //! can be built.
 
 pub mod catalog;
+pub mod delivery;
 pub mod domain;
 pub mod payload;
 pub mod source_fs;
@@ -13,6 +14,10 @@ pub mod source_fs;
 pub use catalog::{
     Catalog, CatalogError, CurrentRecord, SourceFingerprint, SourceRegistration, SourceScan,
     TombstoneGrace,
+};
+pub use delivery::{
+    DeliveryCounts, DeliveryError, DeliveryLease, DeliveryState, LeaseToken, Subscription,
+    SubscriptionConfig, SubscriptionId, SubscriptionMode,
 };
 pub use domain::{
     ArchiveEvent, CanonicalRevision, DeliveryOutcome, DomainError, EventKind, LogicalLocation,

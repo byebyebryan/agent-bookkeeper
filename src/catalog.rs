@@ -11,7 +11,7 @@ use crate::domain::{
     RecordId, RecordIdentity, RecordState, RevisionId,
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Deployment-scoped provenance for one reconciled filesystem source.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,7 +160,7 @@ impl Default for TombstoneGrace {
 /// oriented; deployment code is responsible for placing its database only on a
 /// filesystem with the locking and `fsync` behavior required by the contract.
 pub struct Catalog {
-    connection: Connection,
+    pub(crate) connection: Connection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -699,7 +699,8 @@ impl Catalog {
 
     pub fn events_after(&self, sequence: u64) -> Result<Vec<ArchiveEvent>, CatalogError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, sequence, record_id, record_version, kind, revision_id, committed_at_ms
+            "SELECT id, sequence, record_id, record_version, kind, revision_id,
+                    root_role, source_relative_path, committed_at_ms
              FROM events
              WHERE sequence > ?1
              ORDER BY sequence ASC",
@@ -932,7 +933,7 @@ fn transition(
         .record_version
         .checked_add(1)
         .ok_or_else(|| CatalogError::Corrupt("record version overflow".to_owned()))?;
-    let location = location.unwrap_or(&record.location);
+    let location = location.unwrap_or(&record.location).clone();
     let event_id = EventId::new();
 
     transaction.execute(
@@ -955,14 +956,18 @@ fn transition(
         ],
     )?;
     transaction.execute(
-        "INSERT INTO events (id, record_id, record_version, kind, revision_id, committed_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO events (
+                id, record_id, record_version, kind, revision_id, root_role,
+                source_relative_path, committed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             event_id.as_uuid().as_bytes(),
             record.id.as_uuid().as_bytes(),
             as_i64(next_version, "record version")?,
             kind.as_db(),
             revision_id.map(|id| id.as_uuid().as_bytes().to_vec()),
+            location.root_role(),
+            location.source_relative_path(),
             committed_at_ms,
         ],
     )?;
@@ -972,15 +977,18 @@ fn transition(
     record.location = location.clone();
     record.state = state;
     record.current_revision_id = revision_id;
-    Ok(ArchiveEvent {
+    let event = ArchiveEvent {
         id: event_id,
         sequence,
         record_id: record.id,
         record_version: next_version,
         kind,
         revision_id,
+        location: Some(location),
         committed_at_ms,
-    })
+    };
+    crate::delivery::enqueue_event_for_active_subscriptions(transaction, &event)?;
+    Ok(event)
 }
 
 #[derive(Clone, Debug)]
@@ -1031,7 +1039,21 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveEvent> {
     let record_version = row.get::<_, i64>(3)?;
     let kind = row.get::<_, String>(4)?;
     let revision_id = row.get::<_, Option<Vec<u8>>>(5)?;
-    let committed_at_ms = row.get::<_, i64>(6)?;
+    let root_role = row.get::<_, Option<String>>(6)?;
+    let source_relative_path = row.get::<_, Option<String>>(7)?;
+    let committed_at_ms = row.get::<_, i64>(8)?;
+    let location = match (root_role, source_relative_path) {
+        (Some(root_role), Some(source_relative_path)) => Some(
+            LogicalLocation::new(root_role, source_relative_path)
+                .map_err(|error| to_sql_conversion_error(error.into()))?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(to_sql_conversion_error(CatalogError::Corrupt(
+                "incomplete event location".to_owned(),
+            )));
+        }
+    };
 
     Ok(ArchiveEvent {
         id: EventId::from_uuid(uuid_from_blob(&id).map_err(to_sql_conversion_error)?),
@@ -1048,6 +1070,7 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveEvent> {
             .transpose()
             .map_err(to_sql_conversion_error)?
             .map(RevisionId::from_uuid),
+        location,
         committed_at_ms,
     })
 }
@@ -1171,6 +1194,56 @@ fn migrate(connection: &mut Connection) -> Result<(), CatalogError> {
             params![2, now_ms()?],
         )?;
     }
+    if found < 3 {
+        transaction.execute_batch(
+            "ALTER TABLE events ADD COLUMN root_role TEXT NULL;
+             ALTER TABLE events ADD COLUMN source_relative_path TEXT NULL;",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",
+            params![3, now_ms()?],
+        )?;
+    }
+    if found < 4 {
+        transaction.execute_batch(
+            "CREATE TABLE subscriptions (
+                 id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
+                 consumer_id TEXT NOT NULL,
+                 mode TEXT NOT NULL CHECK(mode IN ('replay_events', 'rebuild_current')),
+                 max_active_leases INTEGER NOT NULL CHECK(max_active_leases > 0),
+                 accepts_moves INTEGER NOT NULL CHECK(accepts_moves IN (0, 1)),
+                 accepts_tombstones INTEGER NOT NULL CHECK(accepts_tombstones IN (0, 1)),
+                 created_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE deliveries (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                 subscription_id BLOB NOT NULL REFERENCES subscriptions(id),
+                 event_id BLOB NOT NULL CHECK(length(event_id) = 16),
+                 event_sequence INTEGER NULL,
+                 record_id BLOB NOT NULL REFERENCES records(id),
+                 record_version INTEGER NOT NULL CHECK(record_version > 0),
+                 kind TEXT NOT NULL CHECK(kind IN ('revision_committed', 'location_changed', 'record_tombstoned', 'record_restored')),
+                 revision_id BLOB NULL REFERENCES revisions(id),
+                 root_role TEXT NULL,
+                 source_relative_path TEXT NULL,
+                 is_snapshot INTEGER NOT NULL CHECK(is_snapshot IN (0, 1)),
+                 state TEXT NOT NULL CHECK(state IN ('queued', 'leased', 'blocked', 'acknowledged', 'superseded', 'ignored_by_policy', 'dead_lettered')),
+                 attempts INTEGER NOT NULL CHECK(attempts >= 0),
+                 lease_token BLOB NULL CHECK(lease_token IS NULL OR length(lease_token) = 16),
+                 lease_expires_at_ms INTEGER NULL,
+                 settled_at_ms INTEGER NULL,
+                 settlement_reason TEXT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 UNIQUE(subscription_id, event_id)
+             );
+             CREATE INDEX deliveries_next_lease ON deliveries(subscription_id, state, event_sequence, id);
+             CREATE INDEX deliveries_record_order ON deliveries(subscription_id, record_id, record_version);",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",
+            params![4, now_ms()?],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -1275,7 +1348,7 @@ mod tests {
     #[test]
     fn schema_and_unchanged_observation_are_stable() {
         let mut catalog = Catalog::open_in_memory().unwrap();
-        assert_eq!(catalog.schema_version().unwrap(), 2);
+        assert_eq!(catalog.schema_version().unwrap(), 4);
         let identity = identity();
         let revision = CanonicalRevision::from_bytes(b"first\n");
 

@@ -51,14 +51,34 @@ complete canonical revision before delivery success, and rejects length,
 metadata, or digest changes. An atomic pathname replacement after open therefore
 does not substitute a new payload; an in-place mutation fails validation.
 
+## Implemented in progress: durable subscription delivery
+
+The catalog now materializes one delivery ledger per subscription epoch:
+
+- `replay_events` copies the ordered archive-event ledger, while
+  `rebuild_current` creates fresh snapshot deliveries for active records;
+- each `(subscription_id, event_id)` appears once, so a retry preserves the
+  external adapter idempotency key;
+- bounded lease admission permits concurrency across records but never lets a
+  later record version pass an unresolved earlier version;
+- acknowledgements, explicit advancing outcomes, retries, expiry, blocked
+  capabilities, and dead letters are durable states; a dead letter remains an
+  ordering barrier;
+- a lease cannot be acknowledged or retried after its expiry, even if the next
+  scheduler pass has not yet run.
+
+This is the durable queue and lease core, not an assertion that an external
+consumer is ready. Materialization, consumer policy, pause/resume control, and
+an adapter run loop remain deliberately outside this slice.
+
 ## Remaining V1.5 slices
 
 1. Finish source operational proof: a resumable byte-budgeted integrity scrub,
    scan/source health status, source-level resource limits, and representative
    large-record measurements.
 2. Finish payload and delivery: bounded materialization for path-only consumers,
-   subscriptions, leases, per-record ordering, outcomes, replay, and an
-   idempotent fake consumer.
+   consumer policy and pause/resume, an idempotent fake consumer, and a
+   controlled adapter run loop.
 3. Operational proof: status, SQLite-aware backup/restore, resource controls,
    representative large-record measurements, and a controlled evidence-consumer
    cohort.

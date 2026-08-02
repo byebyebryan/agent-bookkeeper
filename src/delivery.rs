@@ -1,0 +1,1075 @@
+//! Durable subscription delivery over the archive event ledger.
+
+use std::fmt;
+
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::catalog::{Catalog, CatalogError};
+use crate::domain::{
+    ArchiveEvent, CanonicalRevision, DeliveryOutcome, EventId, EventKind, LogicalLocation,
+    RecordId, RevisionId,
+};
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SubscriptionId(Uuid);
+
+impl SubscriptionId {
+    fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    pub fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for SubscriptionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct LeaseToken(Uuid);
+
+impl LeaseToken {
+    fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubscriptionMode {
+    ReplayEvents,
+    RebuildCurrent,
+}
+
+impl SubscriptionMode {
+    fn as_db(self) -> &'static str {
+        match self {
+            Self::ReplayEvents => "replay_events",
+            Self::RebuildCurrent => "rebuild_current",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionConfig {
+    consumer_id: String,
+    max_active_leases: u32,
+    accepts_moves: bool,
+    accepts_tombstones: bool,
+}
+
+impl SubscriptionConfig {
+    pub fn new(
+        consumer_id: impl Into<String>,
+        max_active_leases: u32,
+        accepts_moves: bool,
+        accepts_tombstones: bool,
+    ) -> Result<Self, DeliveryError> {
+        let consumer_id = consumer_id.into();
+        if consumer_id.is_empty() || consumer_id.trim() != consumer_id || consumer_id.contains('\0')
+        {
+            return Err(DeliveryError::InvalidSubscription(
+                "consumer_id must be non-empty, trimmed, and free of NUL bytes".to_owned(),
+            ));
+        }
+        if max_active_leases == 0 {
+            return Err(DeliveryError::InvalidSubscription(
+                "max_active_leases must be at least one".to_owned(),
+            ));
+        }
+        Ok(Self {
+            consumer_id,
+            max_active_leases,
+            accepts_moves,
+            accepts_tombstones,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Subscription {
+    pub id: SubscriptionId,
+    pub consumer_id: String,
+    pub mode: SubscriptionMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryState {
+    Queued,
+    Leased,
+    Blocked,
+    Acknowledged,
+    Superseded,
+    IgnoredByPolicy,
+    DeadLettered,
+}
+
+impl DeliveryState {
+    fn as_db(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Leased => "leased",
+            Self::Blocked => "blocked",
+            Self::Acknowledged => "acknowledged",
+            Self::Superseded => "superseded",
+            Self::IgnoredByPolicy => "ignored_by_policy",
+            Self::DeadLettered => "dead_lettered",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, DeliveryError> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "leased" => Ok(Self::Leased),
+            "blocked" => Ok(Self::Blocked),
+            "acknowledged" => Ok(Self::Acknowledged),
+            "superseded" => Ok(Self::Superseded),
+            "ignored_by_policy" => Ok(Self::IgnoredByPolicy),
+            "dead_lettered" => Ok(Self::DeadLettered),
+            _ => Err(DeliveryError::Corrupt(format!(
+                "unknown delivery state {value:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryLease {
+    pub delivery_id: u64,
+    pub subscription_id: SubscriptionId,
+    pub event_id: EventId,
+    pub event_sequence: Option<u64>,
+    pub record_id: RecordId,
+    pub record_version: u64,
+    pub kind: EventKind,
+    pub revision_id: Option<RevisionId>,
+    pub revision: Option<CanonicalRevision>,
+    pub location: Option<LogicalLocation>,
+    pub is_snapshot: bool,
+    pub attempt: u32,
+    pub token: LeaseToken,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryCounts {
+    pub queued: u64,
+    pub leased: u64,
+    pub blocked: u64,
+    pub acknowledged: u64,
+    pub superseded: u64,
+    pub ignored_by_policy: u64,
+    pub dead_lettered: u64,
+}
+
+impl Catalog {
+    pub fn create_subscription(
+        &mut self,
+        config: SubscriptionConfig,
+        mode: SubscriptionMode,
+        created_at_ms: i64,
+    ) -> Result<Subscription, DeliveryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let subscription = Subscription {
+            id: SubscriptionId::new(),
+            consumer_id: config.consumer_id.clone(),
+            mode,
+        };
+        transaction.execute(
+            "INSERT INTO subscriptions (
+                id, consumer_id, mode, max_active_leases, accepts_moves,
+                accepts_tombstones, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                subscription.id.as_uuid().as_bytes(),
+                subscription.consumer_id,
+                mode.as_db(),
+                i64::from(config.max_active_leases),
+                i64::from(config.accepts_moves),
+                i64::from(config.accepts_tombstones),
+                created_at_ms,
+            ],
+        )?;
+
+        match mode {
+            SubscriptionMode::ReplayEvents => {
+                let mut statement = transaction.prepare(
+                    "SELECT id, sequence, record_id, record_version, kind, revision_id,
+                            root_role, source_relative_path, committed_at_ms
+                     FROM events ORDER BY sequence ASC",
+                )?;
+                let events = statement
+                    .query_map([], event_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(statement);
+                for event in events {
+                    enqueue_delivery(&transaction, &subscription.id, &config, &event, false)?;
+                }
+            }
+            SubscriptionMode::RebuildCurrent => {
+                let mut statement = transaction.prepare(
+                    "SELECT r.id, r.record_version, r.current_revision_id,
+                            r.root_role, r.source_relative_path
+                     FROM records AS r
+                     WHERE r.state = 'active'
+                     ORDER BY r.id ASC",
+                )?;
+                let rows = statement
+                    .query_map([], |row| {
+                        let record_id =
+                            RecordId::from_uuid(uuid_from_blob(&row.get::<_, Vec<u8>>(0)?)?);
+                        let record_version = as_u64(row.get::<_, i64>(1)?, "record version")?;
+                        let revision_id = row
+                            .get::<_, Option<Vec<u8>>>(2)?
+                            .map(|value| uuid_from_blob(&value).map(RevisionId::from_uuid))
+                            .transpose()?;
+                        let location = LogicalLocation::new(
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        )
+                        .map_err(domain_to_sql_error)?;
+                        Ok(DeliverySnapshot {
+                            record_id,
+                            record_version,
+                            revision_id,
+                            location,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(statement);
+                for snapshot in rows {
+                    let event = ArchiveEvent {
+                        id: EventId::new(),
+                        sequence: 0,
+                        record_id: snapshot.record_id,
+                        record_version: snapshot.record_version,
+                        kind: EventKind::RevisionCommitted,
+                        revision_id: snapshot.revision_id,
+                        location: Some(snapshot.location),
+                        committed_at_ms: created_at_ms,
+                    };
+                    enqueue_delivery(&transaction, &subscription.id, &config, &event, true)?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(subscription)
+    }
+
+    pub fn lease_next(
+        &mut self,
+        subscription_id: SubscriptionId,
+        now_ms: i64,
+        lease_duration_ms: u64,
+    ) -> Result<Option<DeliveryLease>, DeliveryError> {
+        if lease_duration_ms == 0 {
+            return Err(DeliveryError::InvalidLeaseDuration);
+        }
+        let expires_at_ms = now_ms
+            .checked_add(
+                i64::try_from(lease_duration_ms)
+                    .map_err(|_| DeliveryError::InvalidLeaseDuration)?,
+            )
+            .ok_or(DeliveryError::InvalidLeaseDuration)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let max_active_leases = subscription_max_leases(&transaction, subscription_id)?;
+        transaction.execute(
+            "UPDATE deliveries
+             SET state = 'queued', lease_token = NULL, lease_expires_at_ms = NULL
+             WHERE subscription_id = ?1 AND state = 'leased' AND lease_expires_at_ms <= ?2",
+            params![subscription_id.as_uuid().as_bytes(), now_ms],
+        )?;
+        let active_leases: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM deliveries WHERE subscription_id = ?1 AND state = 'leased'",
+            params![subscription_id.as_uuid().as_bytes()],
+            |row| row.get(0),
+        )?;
+        if active_leases >= i64::from(max_active_leases) {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let candidate = transaction
+            .query_row(
+                "SELECT d.id, d.event_id, d.event_sequence, d.record_id, d.record_version,
+                        d.kind, d.revision_id, d.root_role, d.source_relative_path,
+                        d.is_snapshot, d.attempts, rv.byte_length, rv.digest
+                 FROM deliveries AS d
+                 LEFT JOIN revisions AS rv ON rv.id = d.revision_id
+                 WHERE d.subscription_id = ?1
+                   AND d.state = 'queued'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM deliveries AS prior
+                       WHERE prior.subscription_id = d.subscription_id
+                         AND prior.record_id = d.record_id
+                         AND prior.record_version < d.record_version
+                         AND prior.state NOT IN ('acknowledged', 'superseded', 'ignored_by_policy')
+                   )
+                 ORDER BY CASE WHEN d.event_sequence IS NULL THEN 1 ELSE 0 END,
+                          d.event_sequence ASC, d.id ASC
+                 LIMIT 1",
+                params![subscription_id.as_uuid().as_bytes()],
+                delivery_candidate_from_row,
+            )
+            .optional()?;
+        let Some(candidate) = candidate else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let token = LeaseToken::new();
+        let attempt = candidate
+            .attempts
+            .checked_add(1)
+            .ok_or_else(|| DeliveryError::Corrupt("delivery attempt overflow".to_owned()))?;
+        transaction.execute(
+            "UPDATE deliveries
+             SET state = 'leased', attempts = ?1, lease_token = ?2, lease_expires_at_ms = ?3
+             WHERE id = ?4 AND state = 'queued'",
+            params![
+                i64::from(attempt),
+                token.as_uuid().as_bytes(),
+                expires_at_ms,
+                as_i64(candidate.delivery_id, "delivery ID")?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(Some(candidate.into_lease(
+            subscription_id,
+            token,
+            attempt,
+            expires_at_ms,
+        )))
+    }
+
+    pub fn settle_delivery(
+        &mut self,
+        lease: &DeliveryLease,
+        outcome: DeliveryOutcome,
+        settled_at_ms: i64,
+        reason: Option<&str>,
+    ) -> Result<(), DeliveryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = outcome_state(outcome);
+        let changed = transaction.execute(
+            "UPDATE deliveries
+             SET state = ?1, lease_token = NULL, lease_expires_at_ms = NULL,
+                 settled_at_ms = ?2, settlement_reason = ?3
+             WHERE id = ?4 AND subscription_id = ?5 AND state = 'leased'
+               AND lease_token = ?6 AND lease_expires_at_ms > ?2",
+            params![
+                state.as_db(),
+                settled_at_ms,
+                reason,
+                as_i64(lease.delivery_id, "delivery ID")?,
+                lease.subscription_id.as_uuid().as_bytes(),
+                lease.token.as_uuid().as_bytes(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DeliveryError::StaleLease);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn retry_delivery(
+        &mut self,
+        lease: &DeliveryLease,
+        now_ms: i64,
+    ) -> Result<(), DeliveryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE deliveries
+             SET state = 'queued', lease_token = NULL, lease_expires_at_ms = NULL
+             WHERE id = ?1 AND subscription_id = ?2 AND state = 'leased'
+               AND lease_token = ?3 AND lease_expires_at_ms > ?4",
+            params![
+                as_i64(lease.delivery_id, "delivery ID")?,
+                lease.subscription_id.as_uuid().as_bytes(),
+                lease.token.as_uuid().as_bytes(),
+                now_ms,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DeliveryError::StaleLease);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn delivery_counts(
+        &self,
+        subscription_id: SubscriptionId,
+    ) -> Result<DeliveryCounts, DeliveryError> {
+        subscription_max_leases(&self.connection, subscription_id)?;
+        let mut counts = DeliveryCounts {
+            queued: 0,
+            leased: 0,
+            blocked: 0,
+            acknowledged: 0,
+            superseded: 0,
+            ignored_by_policy: 0,
+            dead_lettered: 0,
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT state, COUNT(*) FROM deliveries WHERE subscription_id = ?1 GROUP BY state",
+        )?;
+        let rows = statement.query_map(params![subscription_id.as_uuid().as_bytes()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (state, count) = row?;
+            let count = as_u64(count, "delivery count")?;
+            match DeliveryState::from_db(&state)? {
+                DeliveryState::Queued => counts.queued = count,
+                DeliveryState::Leased => counts.leased = count,
+                DeliveryState::Blocked => counts.blocked = count,
+                DeliveryState::Acknowledged => counts.acknowledged = count,
+                DeliveryState::Superseded => counts.superseded = count,
+                DeliveryState::IgnoredByPolicy => counts.ignored_by_policy = count,
+                DeliveryState::DeadLettered => counts.dead_lettered = count,
+            }
+        }
+        Ok(counts)
+    }
+}
+
+pub(crate) fn enqueue_event_for_active_subscriptions(
+    transaction: &Transaction<'_>,
+    event: &ArchiveEvent,
+) -> Result<(), CatalogError> {
+    let mut statement = transaction.prepare(
+        "SELECT id, consumer_id, max_active_leases, accepts_moves, accepts_tombstones
+         FROM subscriptions",
+    )?;
+    let subscriptions = statement
+        .query_map([], |row| {
+            let id = SubscriptionId::from_uuid(uuid_from_blob(&row.get::<_, Vec<u8>>(0)?)?);
+            let config = SubscriptionConfig {
+                consumer_id: row.get(1)?,
+                max_active_leases: u32::try_from(row.get::<_, i64>(2)?).map_err(|_| {
+                    to_sql_error(DeliveryError::Corrupt(
+                        "invalid max_active_leases".to_owned(),
+                    ))
+                })?,
+                accepts_moves: row.get::<_, i64>(3)? != 0,
+                accepts_tombstones: row.get::<_, i64>(4)? != 0,
+            };
+            Ok((id, config))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for (subscription_id, config) in subscriptions {
+        enqueue_delivery(transaction, &subscription_id, &config, event, false)?;
+    }
+    Ok(())
+}
+
+fn enqueue_delivery(
+    transaction: &Transaction<'_>,
+    subscription_id: &SubscriptionId,
+    config: &SubscriptionConfig,
+    event: &ArchiveEvent,
+    is_snapshot: bool,
+) -> Result<(), CatalogError> {
+    let state = initial_delivery_state(config, event.kind);
+    let (root_role, source_relative_path) = event
+        .location
+        .as_ref()
+        .map(|location| {
+            (
+                Some(location.root_role()),
+                Some(location.source_relative_path()),
+            )
+        })
+        .unwrap_or((None, None));
+    transaction.execute(
+        "INSERT INTO deliveries (
+            subscription_id, event_id, event_sequence, record_id, record_version,
+            kind, revision_id, root_role, source_relative_path, is_snapshot, state,
+            attempts, lease_token, lease_expires_at_ms, settled_at_ms,
+            settlement_reason, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, NULL, NULL, NULL, NULL, ?12)",
+        params![
+            subscription_id.as_uuid().as_bytes(),
+            event.id.as_uuid().as_bytes(),
+            if is_snapshot {
+                None
+            } else {
+                Some(as_i64(event.sequence, "event sequence")?)
+            },
+            event.record_id.as_uuid().as_bytes(),
+            as_i64(event.record_version, "record version")?,
+            event.kind.as_db(),
+            event.revision_id.map(|id| id.as_uuid().as_bytes().to_vec()),
+            root_role,
+            source_relative_path,
+            i64::from(is_snapshot),
+            state.as_db(),
+            event.committed_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn initial_delivery_state(config: &SubscriptionConfig, kind: EventKind) -> DeliveryState {
+    match kind {
+        EventKind::LocationChanged if !config.accepts_moves => DeliveryState::Blocked,
+        EventKind::RecordTombstoned if !config.accepts_tombstones => DeliveryState::Blocked,
+        _ => DeliveryState::Queued,
+    }
+}
+
+fn subscription_max_leases(
+    connection: &rusqlite::Connection,
+    subscription_id: SubscriptionId,
+) -> Result<u32, DeliveryError> {
+    let max_active_leases = connection
+        .query_row(
+            "SELECT max_active_leases FROM subscriptions WHERE id = ?1",
+            params![subscription_id.as_uuid().as_bytes()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or(DeliveryError::UnknownSubscription)?;
+    u32::try_from(max_active_leases)
+        .map_err(|_| DeliveryError::Corrupt("invalid max_active_leases".to_owned()))
+}
+
+fn outcome_state(outcome: DeliveryOutcome) -> DeliveryState {
+    match outcome {
+        DeliveryOutcome::Acknowledged => DeliveryState::Acknowledged,
+        DeliveryOutcome::Superseded => DeliveryState::Superseded,
+        DeliveryOutcome::IgnoredByPolicy => DeliveryState::IgnoredByPolicy,
+        DeliveryOutcome::DeadLettered => DeliveryState::DeadLettered,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DeliverySnapshot {
+    record_id: RecordId,
+    record_version: u64,
+    revision_id: Option<RevisionId>,
+    location: LogicalLocation,
+}
+
+#[derive(Clone, Debug)]
+struct DeliveryCandidate {
+    delivery_id: u64,
+    event_id: EventId,
+    event_sequence: Option<u64>,
+    record_id: RecordId,
+    record_version: u64,
+    kind: EventKind,
+    revision_id: Option<RevisionId>,
+    revision: Option<CanonicalRevision>,
+    location: Option<LogicalLocation>,
+    is_snapshot: bool,
+    attempts: u32,
+}
+
+impl DeliveryCandidate {
+    fn into_lease(
+        self,
+        subscription_id: SubscriptionId,
+        token: LeaseToken,
+        attempt: u32,
+        expires_at_ms: i64,
+    ) -> DeliveryLease {
+        DeliveryLease {
+            delivery_id: self.delivery_id,
+            subscription_id,
+            event_id: self.event_id,
+            event_sequence: self.event_sequence,
+            record_id: self.record_id,
+            record_version: self.record_version,
+            kind: self.kind,
+            revision_id: self.revision_id,
+            revision: self.revision,
+            location: self.location,
+            is_snapshot: self.is_snapshot,
+            attempt,
+            token,
+            expires_at_ms,
+        }
+    }
+}
+
+fn delivery_candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryCandidate> {
+    let delivery_id = as_u64(row.get::<_, i64>(0)?, "delivery ID")?;
+    let event_id = EventId::from_uuid(uuid_from_blob(&row.get::<_, Vec<u8>>(1)?)?);
+    let event_sequence = row
+        .get::<_, Option<i64>>(2)?
+        .map(|value| as_u64(value, "event sequence"))
+        .transpose()?;
+    let record_id = RecordId::from_uuid(uuid_from_blob(&row.get::<_, Vec<u8>>(3)?)?);
+    let record_version = as_u64(row.get::<_, i64>(4)?, "record version")?;
+    let kind = EventKind::from_db(&row.get::<_, String>(5)?).map_err(domain_to_sql_error)?;
+    let revision_id = row
+        .get::<_, Option<Vec<u8>>>(6)?
+        .map(|value| uuid_from_blob(&value).map(RevisionId::from_uuid))
+        .transpose()?;
+    let root_role = row.get::<_, Option<String>>(7)?;
+    let source_relative_path = row.get::<_, Option<String>>(8)?;
+    let location = match (root_role, source_relative_path) {
+        (Some(root_role), Some(source_relative_path)) => Some(
+            LogicalLocation::new(root_role, source_relative_path).map_err(domain_to_sql_error)?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(to_sql_error(DeliveryError::Corrupt(
+                "incomplete delivery location".to_owned(),
+            )));
+        }
+    };
+    let byte_length = row.get::<_, Option<i64>>(11)?;
+    let digest = row.get::<_, Option<Vec<u8>>>(12)?;
+    let revision = match (byte_length, digest) {
+        (Some(byte_length), Some(digest)) => Some(CanonicalRevision::from_parts(
+            as_u64(byte_length, "revision byte length")?,
+            digest_from_blob(digest)?,
+        )),
+        (None, None) => None,
+        _ => {
+            return Err(to_sql_error(DeliveryError::Corrupt(
+                "incomplete delivery revision".to_owned(),
+            )));
+        }
+    };
+    Ok(DeliveryCandidate {
+        delivery_id,
+        event_id,
+        event_sequence,
+        record_id,
+        record_version,
+        kind,
+        revision_id,
+        revision,
+        location,
+        is_snapshot: row.get::<_, i64>(9)? != 0,
+        attempts: u32::try_from(row.get::<_, i64>(10)?).map_err(|_| {
+            to_sql_error(DeliveryError::Corrupt(
+                "invalid delivery attempts".to_owned(),
+            ))
+        })?,
+    })
+}
+
+fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveEvent> {
+    let root_role = row.get::<_, Option<String>>(6)?;
+    let source_relative_path = row.get::<_, Option<String>>(7)?;
+    let location = match (root_role, source_relative_path) {
+        (Some(root_role), Some(source_relative_path)) => Some(
+            LogicalLocation::new(root_role, source_relative_path).map_err(domain_to_sql_error)?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(to_sql_error(DeliveryError::Corrupt(
+                "incomplete event location".to_owned(),
+            )));
+        }
+    };
+    Ok(ArchiveEvent {
+        id: EventId::from_uuid(uuid_from_blob(&row.get::<_, Vec<u8>>(0)?)?),
+        sequence: as_u64(row.get::<_, i64>(1)?, "event sequence")?,
+        record_id: RecordId::from_uuid(uuid_from_blob(&row.get::<_, Vec<u8>>(2)?)?),
+        record_version: as_u64(row.get::<_, i64>(3)?, "record version")?,
+        kind: EventKind::from_db(&row.get::<_, String>(4)?).map_err(domain_to_sql_error)?,
+        revision_id: row
+            .get::<_, Option<Vec<u8>>>(5)?
+            .map(|value| uuid_from_blob(&value).map(RevisionId::from_uuid))
+            .transpose()?,
+        location,
+        committed_at_ms: row.get::<_, i64>(8)?,
+    })
+}
+
+fn as_i64(value: u64, field: &str) -> rusqlite::Result<i64> {
+    i64::try_from(value).map_err(|_| {
+        to_sql_error(DeliveryError::Corrupt(format!(
+            "{field} exceeds SQLite range"
+        )))
+    })
+}
+
+fn as_u64(value: i64, field: &str) -> rusqlite::Result<u64> {
+    u64::try_from(value)
+        .map_err(|_| to_sql_error(DeliveryError::Corrupt(format!("negative {field}"))))
+}
+
+fn uuid_from_blob(value: &[u8]) -> rusqlite::Result<Uuid> {
+    Uuid::from_slice(value)
+        .map_err(|_| to_sql_error(DeliveryError::Corrupt("invalid UUID blob".to_owned())))
+}
+
+fn digest_from_blob(value: Vec<u8>) -> rusqlite::Result<[u8; blake3::OUT_LEN]> {
+    value.try_into().map_err(|_| {
+        to_sql_error(DeliveryError::Corrupt(
+            "invalid BLAKE3 digest length".to_owned(),
+        ))
+    })
+}
+
+fn domain_to_sql_error(error: crate::domain::DomainError) -> rusqlite::Error {
+    to_sql_error(DeliveryError::Corrupt(error.to_string()))
+}
+
+fn to_sql_error(error: DeliveryError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(error))
+}
+
+#[derive(Debug, Error)]
+pub enum DeliveryError {
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("invalid subscription: {0}")]
+    InvalidSubscription(String),
+    #[error("unknown subscription")]
+    UnknownSubscription,
+    #[error("lease duration must fit in a positive i64 millisecond timestamp")]
+    InvalidLeaseDuration,
+    #[error("lease is stale, expired, or already settled")]
+    StaleLease,
+    #[error("delivery state is corrupt: {0}")]
+    Corrupt(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SubscriptionConfig, SubscriptionMode};
+    use crate::catalog::Catalog;
+    use crate::domain::{
+        CanonicalRevision, DeliveryOutcome, EventKind, LogicalLocation, ProducerId, RecordIdentity,
+    };
+
+    fn identity() -> RecordIdentity {
+        RecordIdentity::new(
+            ProducerId::new(),
+            "codex",
+            "session-a",
+            "transcript",
+            "primary",
+        )
+        .unwrap()
+    }
+
+    fn location() -> LogicalLocation {
+        LogicalLocation::new("active", "sessions/a.jsonl").unwrap()
+    }
+
+    fn config() -> SubscriptionConfig {
+        SubscriptionConfig::new("fake-consumer", 1, true, true).unwrap()
+    }
+
+    #[test]
+    fn later_record_versions_wait_for_the_prior_lease_to_settle() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let subscription = catalog
+            .create_subscription(config(), SubscriptionMode::ReplayEvents, 0)
+            .unwrap();
+        let identity = identity();
+        catalog
+            .observe_present_at(
+                &identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"first\n"),
+                10,
+            )
+            .unwrap();
+        catalog
+            .observe_present_at(
+                &identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"first\nsecond\n"),
+                20,
+            )
+            .unwrap();
+
+        let first = catalog
+            .lease_next(subscription.id, 30, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.record_version, 1);
+        assert!(
+            catalog
+                .lease_next(subscription.id, 31, 100)
+                .unwrap()
+                .is_none()
+        );
+        catalog
+            .settle_delivery(&first, DeliveryOutcome::Acknowledged, 40, None)
+            .unwrap();
+        let second = catalog
+            .lease_next(subscription.id, 41, 100)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(second.record_version, 2);
+        assert_eq!(second.kind, EventKind::RevisionCommitted);
+        assert_eq!(
+            second.location.unwrap().source_relative_path(),
+            "sessions/a.jsonl"
+        );
+    }
+
+    #[test]
+    fn unrelated_records_can_use_the_configured_parallel_lease_budget() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let subscription = catalog
+            .create_subscription(
+                SubscriptionConfig::new("fake-consumer", 2, true, true).unwrap(),
+                SubscriptionMode::ReplayEvents,
+                0,
+            )
+            .unwrap();
+        let first_identity = identity();
+        let second_identity = identity();
+        catalog
+            .observe_present_at(
+                &first_identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"first\n"),
+                10,
+            )
+            .unwrap();
+        catalog
+            .observe_present_at(
+                &second_identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"second\n"),
+                20,
+            )
+            .unwrap();
+
+        let first = catalog
+            .lease_next(subscription.id, 30, 100)
+            .unwrap()
+            .unwrap();
+        let second = catalog
+            .lease_next(subscription.id, 31, 100)
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(first.record_id, second.record_id);
+        assert!(
+            catalog
+                .lease_next(subscription.id, 32, 100)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expired_lease_redelivers_with_the_same_event_id() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let subscription = catalog
+            .create_subscription(config(), SubscriptionMode::ReplayEvents, 0)
+            .unwrap();
+        let identity = identity();
+        catalog
+            .observe_present_at(
+                &identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"first\n"),
+                10,
+            )
+            .unwrap();
+
+        let first = catalog
+            .lease_next(subscription.id, 20, 10)
+            .unwrap()
+            .unwrap();
+        let redelivery = catalog
+            .lease_next(subscription.id, 30, 10)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(redelivery.event_id, first.event_id);
+        assert_ne!(redelivery.token, first.token);
+        assert_eq!(redelivery.attempt, 2);
+    }
+
+    #[test]
+    fn an_expired_lease_cannot_acknowledge_or_retry_before_scheduler_cleanup() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let subscription = catalog
+            .create_subscription(config(), SubscriptionMode::ReplayEvents, 0)
+            .unwrap();
+        let identity = identity();
+        catalog
+            .observe_present_at(
+                &identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"first\n"),
+                10,
+            )
+            .unwrap();
+
+        let lease = catalog
+            .lease_next(subscription.id, 20, 10)
+            .unwrap()
+            .unwrap();
+        assert!(
+            catalog
+                .settle_delivery(&lease, DeliveryOutcome::Acknowledged, 30, None)
+                .is_err()
+        );
+        assert!(catalog.retry_delivery(&lease, 30).is_err());
+
+        let replacement = catalog
+            .lease_next(subscription.id, 30, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.event_id, lease.event_id);
+        assert_eq!(replacement.attempt, 2);
+    }
+
+    #[test]
+    fn zero_duration_lease_is_rejected() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let subscription = catalog
+            .create_subscription(config(), SubscriptionMode::ReplayEvents, 0)
+            .unwrap();
+
+        assert!(catalog.lease_next(subscription.id, 20, 0).is_err());
+    }
+
+    #[test]
+    fn dead_letter_is_settled_but_keeps_later_record_versions_blocked() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let subscription = catalog
+            .create_subscription(config(), SubscriptionMode::ReplayEvents, 0)
+            .unwrap();
+        let identity = identity();
+        catalog
+            .observe_present_at(
+                &identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"first\n"),
+                10,
+            )
+            .unwrap();
+        catalog
+            .observe_present_at(
+                &identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"second\n"),
+                20,
+            )
+            .unwrap();
+
+        let first = catalog
+            .lease_next(subscription.id, 30, 100)
+            .unwrap()
+            .unwrap();
+        catalog
+            .settle_delivery(
+                &first,
+                DeliveryOutcome::DeadLettered,
+                40,
+                Some("fixture failure"),
+            )
+            .unwrap();
+
+        assert!(
+            catalog
+                .lease_next(subscription.id, 41, 100)
+                .unwrap()
+                .is_none()
+        );
+        let counts = catalog.delivery_counts(subscription.id).unwrap();
+        assert_eq!(counts.dead_lettered, 1);
+        assert_eq!(counts.queued, 1);
+    }
+
+    #[test]
+    fn subscription_epoch_rebuild_has_fresh_delivery_identity() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let identity = identity();
+        catalog
+            .observe_present_at(
+                &identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"first\n"),
+                10,
+            )
+            .unwrap();
+        let first_subscription = catalog
+            .create_subscription(config(), SubscriptionMode::ReplayEvents, 20)
+            .unwrap();
+        let first = catalog
+            .lease_next(first_subscription.id, 30, 100)
+            .unwrap()
+            .unwrap();
+        catalog
+            .settle_delivery(&first, DeliveryOutcome::Acknowledged, 40, None)
+            .unwrap();
+
+        let rebuilt = catalog
+            .create_subscription(config(), SubscriptionMode::RebuildCurrent, 50)
+            .unwrap();
+        let snapshot = catalog.lease_next(rebuilt.id, 60, 100).unwrap().unwrap();
+
+        assert_ne!(rebuilt.id, first_subscription.id);
+        assert!(snapshot.is_snapshot);
+        assert_ne!(snapshot.event_id, first.event_id);
+        assert_eq!(snapshot.record_id, first.record_id);
+    }
+
+    #[test]
+    fn unsupported_tombstone_is_blocked_instead_of_silently_settled() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let no_tombstones = SubscriptionConfig::new("fake-consumer", 1, true, false).unwrap();
+        let subscription = catalog
+            .create_subscription(no_tombstones, SubscriptionMode::ReplayEvents, 0)
+            .unwrap();
+        let identity = identity();
+        catalog
+            .observe_present_at(
+                &identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"first\n"),
+                10,
+            )
+            .unwrap();
+        let revision = catalog
+            .lease_next(subscription.id, 20, 100)
+            .unwrap()
+            .unwrap();
+        catalog
+            .settle_delivery(&revision, DeliveryOutcome::Acknowledged, 30, None)
+            .unwrap();
+        catalog.tombstone_at(&identity, 40).unwrap();
+
+        assert!(
+            catalog
+                .lease_next(subscription.id, 50, 100)
+                .unwrap()
+                .is_none()
+        );
+        let counts = catalog.delivery_counts(subscription.id).unwrap();
+        assert_eq!(counts.blocked, 1);
+    }
+}
