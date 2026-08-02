@@ -35,6 +35,9 @@ explicit one-shot runner. It requires absolute operator-supplied paths, two
 stability scans, a hash budget, a hard per-record cohort limit, a delivery
 count/byte limit, and a local MemPalace CLI. It owns only its SQLite ledger,
 lease cache, and receipts; it never performs client transport or starts a timer.
+`Dockerfile.mempalace-controller` provides an optional image layer: the
+operator pins the base MemPalace image through `MEMPALACE_IMAGE` and supplies
+all runtime paths and limits.
 See [implementation status](docs/implementation-status.md).
 
 V2's protocol is detailed but intentionally not frozen until the shared V1.5
