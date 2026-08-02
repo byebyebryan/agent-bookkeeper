@@ -5,6 +5,7 @@
 //! performs network transport itself.
 
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::process;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,9 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agent_bookkeeper::{
     Catalog, CodexRolloutLayout, ControlledDeliveryAttempt, ControlledDeliveryOutcome,
     ControlledRunLimits, DeletionMode, DeliveryRoots, HindsightConsumer, HindsightHttpConfig,
-    HindsightHttpRunner, MaterializationCache, MaterializationLimits, ProducerId, ReconcileReport,
-    Reconciler, SourceConfig, SourceRoot, StabilityPolicy, SubscriptionConfig, SubscriptionMode,
-    catalog_status, run_path_consumer,
+    HindsightHttpRunner, HindsightRenderProfile, MaterializationCache, MaterializationLimits,
+    ProducerId, ReconcileReport, Reconciler, SourceConfig, SourceRoot, StabilityPolicy,
+    SubscriptionConfig, SubscriptionMode, catalog_status, run_path_consumer,
 };
 use uuid::Uuid;
 
@@ -29,6 +30,11 @@ fn main() {
 
 fn run(arguments: Vec<String>) -> Result<(), String> {
     let config = ControllerConfig::parse(arguments)?;
+    let allowed_relative_paths = config
+        .include_manifest
+        .as_deref()
+        .map(read_include_manifest)
+        .transpose()?;
     let mut catalog = Catalog::open(&config.catalog_path).map_err(display_error)?;
     let now_ms = current_time_ms()?;
     let status = catalog_status(&catalog, now_ms).map_err(display_error)?;
@@ -73,6 +79,12 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
     .with_hash_byte_budget_per_scan(config.hash_budget_bytes)
     .with_max_candidate_bytes(config.max_candidate_bytes)
     .map_err(display_error)?;
+    let source_config = match allowed_relative_paths {
+        Some(paths) => source_config
+            .with_allowed_relative_paths(paths)
+            .map_err(display_error)?,
+        None => source_config,
+    };
     let mut reconciler = Reconciler::new(source_config, CodexRolloutLayout);
     let mut reports = Vec::with_capacity(config.reconcile_passes as usize);
     for _ in 0..config.reconcile_passes {
@@ -97,9 +109,13 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
         )
         .map_err(display_error)?,
     );
-    let mut consumer =
-        HindsightConsumer::new(config.receipt_root, config.hindsight_bank.clone(), runner)
-            .map_err(display_error)?;
+    let mut consumer = HindsightConsumer::new_with_render_profile(
+        config.receipt_root,
+        config.hindsight_bank.clone(),
+        config.render_profile,
+        runner,
+    )
+    .map_err(display_error)?;
     let delivery_report = run_path_consumer(
         &mut catalog,
         subscription_id,
@@ -124,7 +140,10 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
             "source_id": config.source_id,
             "consumer_id": config.consumer_id,
             "subscription_id": subscription_id.as_uuid().to_string(),
-            "hindsight": {"bank_id": config.hindsight_bank},
+            "hindsight": {
+                "bank_id": config.hindsight_bank,
+                "render_profile": config.render_profile.name(),
+            },
             "reconcile_passes": config.reconcile_passes,
             "reconcile": totals,
             "delivery": {
@@ -162,6 +181,8 @@ struct ControllerConfig {
     lease_duration_ms: u64,
     reconcile_passes: u32,
     consumer_id: String,
+    render_profile: HindsightRenderProfile,
+    include_manifest: Option<PathBuf>,
 }
 
 impl ControllerConfig {
@@ -237,6 +258,16 @@ impl ControllerConfig {
             consumer_id: values
                 .remove("--consumer-id")
                 .unwrap_or_else(|| DEFAULT_CONSUMER_ID.to_owned()),
+            render_profile: HindsightRenderProfile::from_name(
+                &values
+                    .remove("--render-profile")
+                    .unwrap_or_else(|| "legacy-v1".to_owned()),
+            )
+            .map_err(display_error)?,
+            include_manifest: values
+                .remove("--include-manifest")
+                .map(|value| absolute_path(value, "--include-manifest"))
+                .transpose()?,
         };
         if !values.is_empty() {
             return Err(format!(
@@ -295,6 +326,47 @@ fn parse_u32(value: String, name: &str) -> Result<u32, String> {
         .map_err(|error| format!("{name} must be an unsigned integer: {error}"))
 }
 
+fn read_include_manifest(path: &std::path::Path) -> Result<Vec<PathBuf>, String> {
+    let content = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "could not read --include-manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    let paths = content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line = line.trim();
+            (!line.is_empty() && !line.starts_with('#')).then(|| (index + 1, PathBuf::from(line)))
+        })
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Err(format!(
+            "--include-manifest {} contains no source-relative paths",
+            path.display()
+        ));
+    }
+    if paths.iter().any(|(_, path)| path.is_absolute()) {
+        return Err(format!(
+            "--include-manifest {} contains an absolute path",
+            path.display()
+        ));
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for (line, path) in &paths {
+        let path_string = path.to_string_lossy();
+        if !unique.insert(path_string.to_string()) {
+            return Err(format!(
+                "--include-manifest {} repeats source-relative path {:?} on line {line}",
+                path_string,
+                path.display()
+            ));
+        }
+    }
+    Ok(paths.into_iter().map(|(_, path)| path).collect())
+}
+
 fn reconcile_totals(reports: &[ReconcileReport]) -> serde_json::Value {
     serde_json::json!({
         "files_enumerated": reports.iter().map(|report| report.files_enumerated).sum::<u64>(),
@@ -344,5 +416,13 @@ fn display_error(error: impl std::fmt::Display) -> String {
 }
 
 fn usage() -> &'static str {
-    "usage: agent-bookkeeper-hindsight-controller \\\n+  --catalog ABSOLUTE_PATH --source-id ID --producer-id UUID \\\n+  --active-root ABSOLUTE_PATH --archived-root ABSOLUTE_PATH \\\n+  --cache-root ABSOLUTE_PATH --receipt-root ABSOLUTE_PATH \\\n+  --hindsight-base-url URL --hindsight-bank ID --hindsight-timeout-seconds N \\\n+  --hash-budget-bytes N --max-candidate-bytes N --max-deliveries N \\\n+  --max-payload-bytes N --lease-duration-ms N [--reconcile-passes N] [--consumer-id ID]"
+    r#"usage: agent-bookkeeper-hindsight-controller \
+  --catalog ABSOLUTE_PATH --source-id ID --producer-id UUID \
+  --active-root ABSOLUTE_PATH --archived-root ABSOLUTE_PATH \
+  --cache-root ABSOLUTE_PATH --receipt-root ABSOLUTE_PATH \
+  --hindsight-base-url URL --hindsight-bank ID --hindsight-timeout-seconds N \
+  --hash-budget-bytes N --max-candidate-bytes N --max-deliveries N \
+  --max-payload-bytes N --lease-duration-ms N [--reconcile-passes N] [--consumer-id ID] \
+  [--render-profile legacy-v1|reference-message-v2|reference-tool-aware-v2] \
+  [--include-manifest ABSOLUTE_PATH]"#
 }

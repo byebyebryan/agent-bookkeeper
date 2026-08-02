@@ -35,13 +35,20 @@ explicit one-shot runner. It requires absolute operator-supplied paths, two
 stability scans, a hash budget, a hard per-record cohort limit, a delivery
 count/byte limit, and a local MemPalace CLI. The companion
 `agent-bookkeeper-hindsight-controller` drives a synchronous Hindsight retain
-adapter through its HTTP API. It renders only Codex user and assistant messages
-from a verified lease, stamps every retain with record/revision provenance, and
-uses a stable `document_id` so retries replace rather than duplicate learned
-facts. Both controllers own only their SQLite ledger, lease cache, and receipts;
-they never perform client transport or start a timer. The optional Dockerfiles
-provide image layers while the operator supplies all runtime paths, endpoints,
-and limits.
+adapter through its HTTP API. Its stable legacy renderer is retained for an
+existing pilot, while opt-in reference profiles follow Hindsight's maintained
+Codex semantics: use final user/assistant response items, discard synthetic
+`AGENTS.md` setup text and injected-memory echoes, and optionally preserve
+bounded structured tool context. A receipt and request metadata record the
+chosen renderer profile, so trial evidence cannot be confused with older
+output. An optional source-relative include manifest makes a cohort an exact
+allowlist rather than a size-limited prefix of a larger archive. The adapter
+stamps every retain with record/revision provenance and uses a stable
+`document_id` so retries replace rather than duplicate learned facts. Both
+controllers own only their SQLite ledger, lease cache, and receipts; they never
+perform client transport or start a timer. The optional Dockerfiles provide
+image layers while the operator supplies all runtime paths, endpoints, and
+limits.
 See [implementation status](docs/implementation-status.md).
 
 V2's protocol is detailed but intentionally not frozen until the shared V1.5

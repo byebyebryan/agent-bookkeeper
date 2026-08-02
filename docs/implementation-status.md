@@ -114,21 +114,30 @@ does not install a timer, perform transport, or start a background worker.
 
 `HindsightConsumer` is a separate, synchronous consumer subscription for a
 Hindsight-compatible HTTP API. It re-verifies the materialized lease revision,
-parses the Codex JSONL only enough to render `user_message` and `agent_message`
-events, and deliberately excludes tool calls, tool output, session
-instructions, and mutable source paths. The request carries a stable
-`agent-bookkeeper://record/<record-id>` source/document ID, canonical revision,
-event, logical location, session metadata, and a conservative agent/workspace
-tag. A revision update uses Hindsight's `replace` upsert mode; a retry after a
-lost Bookkeeper acknowledgement is therefore safe. A durable receipt is written
-only after the HTTP retain request succeeds.
+has a stable `legacy-v1` renderer plus two opt-in reference profiles. The
+reference profiles follow Hindsight's maintained Codex integration: they prefer
+`response_item` user messages and assistant `final_answer` messages, drop
+synthetic `AGENTS.md` setup text, and strip Hindsight-injected memory echoes.
+`reference-message-v2` retains structured user/assistant text only;
+`reference-tool-aware-v2` additionally groups tool calls and bounded (2,000
+character) tool results under assistant turns. Legacy `event_msg` messages are a
+compatibility fallback only when no response-item conversation exists. The
+request carries a stable `agent-bookkeeper://record/<record-id>` source/document
+ID, canonical revision, event, logical location, session metadata, renderer
+profile and filter counts, plus a conservative agent/workspace tag. A revision
+update uses Hindsight's `replace` upsert mode; a retry after a lost Bookkeeper
+acknowledgement is therefore safe. A durable receipt is written only after the
+HTTP retain request succeeds.
 
 `agent-bookkeeper-hindsight-controller` uses the same bounded reconciliation
 and delivery limits as the MemPalace controller, but owns a distinct consumer
 cursor and receipt root. It is intentionally a manual one-shot: service
 unavailability becomes a normal queued retry, not an agent-hook failure. A
 metadata-only tombstone is `ignored_by_policy` because deletion of learned facts
-needs a separately reviewed correction/retention policy.
+needs a separately reviewed correction/retention policy. A controlled run may
+pass `--include-manifest` with one root-relative JSONL path per line; the
+controller rejects an empty, duplicate, or absolute entry and makes unlisted
+files invisible for that source configuration.
 
 ## Implemented in progress: verified external payload reader
 

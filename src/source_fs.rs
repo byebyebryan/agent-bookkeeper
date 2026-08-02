@@ -245,6 +245,7 @@ pub struct SourceConfig {
     stability_policy: StabilityPolicy,
     hash_byte_budget_per_scan: u64,
     max_candidate_bytes: Option<u64>,
+    allowed_relative_paths: Option<HashSet<String>>,
 }
 
 impl SourceConfig {
@@ -291,6 +292,7 @@ impl SourceConfig {
             stability_policy,
             hash_byte_budget_per_scan: u64::MAX,
             max_candidate_bytes: None,
+            allowed_relative_paths: None,
         })
     }
 
@@ -334,6 +336,39 @@ impl SourceConfig {
 
     pub fn max_candidate_bytes(&self) -> Option<u64> {
         self.max_candidate_bytes
+    }
+
+    /// Restricts a controlled run to an explicit immutable cohort of
+    /// root-relative paths. It is an admission boundary, not a glob: a path is
+    /// either named exactly or it is invisible to this source configuration.
+    pub fn with_allowed_relative_paths(
+        mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self, SourceError> {
+        let mut allowed_relative_paths = HashSet::new();
+        for path in paths {
+            let normalized = normalized_relative_path(&path)?;
+            if !allowed_relative_paths.insert(normalized.clone()) {
+                return Err(SourceError::InvalidConfiguration(format!(
+                    "duplicate allowed source-relative path {normalized:?}"
+                )));
+            }
+        }
+        if allowed_relative_paths.is_empty() {
+            return Err(SourceError::InvalidConfiguration(
+                "an explicit allowed source-relative path set must not be empty".to_owned(),
+            ));
+        }
+        self.allowed_relative_paths = Some(allowed_relative_paths);
+        Ok(self)
+    }
+
+    fn allows_relative_path(&self, path: &Path) -> bool {
+        self.allowed_relative_paths.as_ref().is_none_or(|allowed| {
+            normalized_relative_path(path)
+                .map(|path| allowed.contains(&path))
+                .unwrap_or(false)
+        })
     }
 
     fn registration(
@@ -723,6 +758,7 @@ where
         for (root_index, root) in self.config.roots.iter().enumerate() {
             enumerate_root(root_index, root, Path::new(""), &mut candidates)?;
         }
+        candidates.retain(|candidate| self.config.allows_relative_path(&candidate.relative_path));
         Ok(candidates)
     }
 }
@@ -1163,6 +1199,30 @@ mod tests {
         assert_eq!(steady.bytes_hashed, 0);
         assert_eq!(steady.already_stable, 1);
         assert_eq!(catalog.events_after(0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn explicit_allowed_paths_admit_only_the_named_controlled_cohort() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let selected_id = Uuid::new_v4();
+        let excluded_id = Uuid::new_v4();
+        let selected_path = session_file(root, selected_id, "selected\n");
+        session_file(root, excluded_id, "excluded\n");
+        let selected_relative = selected_path.strip_prefix(root).unwrap().to_path_buf();
+        let config = guarded_config(root, DeletionMode::Disabled)
+            .with_allowed_relative_paths(vec![selected_relative])
+            .unwrap();
+        let mut reconciler = Reconciler::new(config, CodexRolloutLayout);
+        let mut catalog = Catalog::open_in_memory().unwrap();
+
+        let first = reconciler.scan(&mut catalog).unwrap();
+        let second = reconciler.scan(&mut catalog).unwrap();
+
+        assert_eq!(first.files_enumerated, 1);
+        assert_eq!(second.files_enumerated, 1);
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(catalog.events_after(0).unwrap().len(), 1);
     }
 
     #[test]
