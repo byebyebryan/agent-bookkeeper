@@ -42,6 +42,9 @@ The read-only source foundation provides:
   state or emit a delayed tombstone.
 - an optional per-scan full-hash byte budget, with deferred stable candidates
   remaining hash-pending for a later scan instead of being forgotten.
+- an optional hard per-record cohort limit; an oversized candidate is reported
+  and remains hash-pending rather than consuming the budget's permitted first
+  oversized admission.
 
 Codex's local rollout layout is treated as a locally observed, versioned source
 schema—not a public Codex storage protocol. An unexpected layout or metadata
@@ -100,6 +103,12 @@ metadata-only tombstone is durably `ignored_by_policy`, not falsely reported as
 removed from an existing semantic index. The first deployed cohort keeps
 source-deletion inference disabled and treats this as an explicit later policy
 decision.
+
+`agent-bookkeeper-mempalace-controller` wires this adapter into an explicit
+one-shot run: it reuses one durable subscription by consumer ID, scans the
+operator-provided active and archived roots twice for stability, applies the
+hard record-size and run budgets, then prints a content-free JSON summary. It
+does not install a timer, perform transport, or start a background worker.
 
 ## Implemented in progress: verified external payload reader
 

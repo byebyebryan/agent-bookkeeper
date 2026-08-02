@@ -244,6 +244,7 @@ pub struct SourceConfig {
     deletion_mode: DeletionMode,
     stability_policy: StabilityPolicy,
     hash_byte_budget_per_scan: u64,
+    max_candidate_bytes: Option<u64>,
 }
 
 impl SourceConfig {
@@ -289,6 +290,7 @@ impl SourceConfig {
             deletion_mode,
             stability_policy,
             hash_byte_budget_per_scan: u64::MAX,
+            max_candidate_bytes: None,
         })
     }
 
@@ -310,6 +312,28 @@ impl SourceConfig {
 
     pub fn hash_byte_budget_per_scan(&self) -> u64 {
         self.hash_byte_budget_per_scan
+    }
+
+    /// Defers candidates above a controlled consumer cohort's approved size.
+    ///
+    /// Unlike the ordinary hash budget, this is a hard admission boundary: an
+    /// oversized record remains visible in the report for an explicit later
+    /// cohort instead of being admitted as the first oversized hash.
+    pub fn with_max_candidate_bytes(
+        mut self,
+        max_candidate_bytes: u64,
+    ) -> Result<Self, SourceError> {
+        if max_candidate_bytes == 0 {
+            return Err(SourceError::InvalidConfiguration(
+                "maximum candidate bytes must be greater than zero".to_owned(),
+            ));
+        }
+        self.max_candidate_bytes = Some(max_candidate_bytes);
+        Ok(self)
+    }
+
+    pub fn max_candidate_bytes(&self) -> Option<u64> {
+        self.max_candidate_bytes
     }
 
     fn registration(
@@ -444,6 +468,14 @@ where
                 continue;
             }
             let candidate_bytes = candidate.candidate.fingerprint.byte_length();
+            if self
+                .config
+                .max_candidate_bytes
+                .is_some_and(|limit| candidate_bytes > limit)
+            {
+                report.deferred_by_size_limit += 1;
+                continue;
+            }
             if report.bytes_hashed > 0
                 && report
                     .bytes_hashed
@@ -701,6 +733,7 @@ pub struct ReconcileReport {
     pub awaiting_stability: u64,
     pub already_stable: u64,
     pub deferred_by_hash_budget: u64,
+    pub deferred_by_size_limit: u64,
     pub changed_during_scan: u64,
     pub bytes_hashed: u64,
     pub events: Vec<ArchiveEvent>,
@@ -1478,5 +1511,29 @@ mod tests {
         assert_eq!(resumed.events.len(), 1);
         assert_eq!(resumed.already_stable, 1);
         assert_eq!(catalog.events_after(0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ordinary_scan_size_limit_defers_oversized_candidates_without_admitting_them() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        session_file(root, Uuid::new_v4(), "small\n");
+        session_file(
+            root,
+            Uuid::new_v4(),
+            "this record exceeds the selected cohort cap\n",
+        );
+        let config = guarded_config(root, DeletionMode::Disabled)
+            .with_max_candidate_bytes(100)
+            .unwrap();
+        let mut reconciler = Reconciler::new(config, CodexRolloutLayout);
+        let mut catalog = Catalog::open_in_memory().unwrap();
+
+        reconciler.scan(&mut catalog).unwrap();
+        let constrained = reconciler.scan(&mut catalog).unwrap();
+
+        assert_eq!(constrained.events.len(), 1);
+        assert_eq!(constrained.deferred_by_size_limit, 1);
+        assert_eq!(catalog.events_after(0).unwrap().len(), 1);
     }
 }

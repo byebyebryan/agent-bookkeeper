@@ -29,6 +29,12 @@ recognized crash leftovers. A controlled MemPalace CLI adapter now passes only
 verified lease-scoped paths, provides a stable Bookkeeper record source ID, and
 writes durable provenance receipts. It is ready for a bounded operator cohort,
 not a standing worker or a general promotion claim.
+
+The `agent-bookkeeper-mempalace-controller` binary is the corresponding
+explicit one-shot runner. It requires absolute operator-supplied paths, two
+stability scans, a hash budget, a hard per-record cohort limit, a delivery
+count/byte limit, and a local MemPalace CLI. It owns only its SQLite ledger,
+lease cache, and receipts; it never performs client transport or starts a timer.
 See [implementation status](docs/implementation-status.md).
 
 V2's protocol is detailed but intentionally not frozen until the shared V1.5
@@ -78,6 +84,12 @@ rtk cargo fmt --check
 rtk cargo clippy --all-targets -- -D warnings
 rtk cargo test
 rtk git diff --check
+```
+
+Inspect controller arguments with:
+
+```sh
+rtk cargo run --bin agent-bookkeeper-mempalace-controller -- --help
 ```
 
 ## License
