@@ -41,7 +41,10 @@ Codex semantics: use final user/assistant response items, discard synthetic
 `AGENTS.md` setup text and injected-memory echoes, and optionally preserve
 bounded structured tool context. A receipt and request metadata record the
 chosen renderer profile, so trial evidence cannot be confused with older
-output. An optional source-relative include manifest makes a cohort an exact
+output. An optional `--observation-scopes` setting records the explicit
+Hindsight consolidation boundary (`per_tag`, `combined`, `all_combinations`, or
+`shared`) in each retain request and receipt; its default preserves the server
+default. An optional source-relative include manifest makes a cohort an exact
 allowlist rather than a size-limited prefix of a larger archive. The adapter
 stamps every retain with record/revision provenance and uses a stable
 `document_id` so retries replace rather than duplicate learned facts. Both

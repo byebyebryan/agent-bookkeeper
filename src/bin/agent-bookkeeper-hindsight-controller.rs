@@ -13,9 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agent_bookkeeper::{
     Catalog, CodexRolloutLayout, ControlledDeliveryAttempt, ControlledDeliveryOutcome,
     ControlledRunLimits, DeletionMode, DeliveryRoots, HindsightConsumer, HindsightHttpConfig,
-    HindsightHttpRunner, HindsightRenderProfile, MaterializationCache, MaterializationLimits,
-    ProducerId, ReconcileReport, Reconciler, SourceConfig, SourceRoot, StabilityPolicy,
-    SubscriptionConfig, SubscriptionMode, catalog_status, run_path_consumer,
+    HindsightHttpRunner, HindsightObservationScopes, HindsightRenderProfile, MaterializationCache,
+    MaterializationLimits, ProducerId, ReconcileReport, Reconciler, SourceConfig, SourceRoot,
+    StabilityPolicy, SubscriptionConfig, SubscriptionMode, catalog_status, run_path_consumer,
 };
 use uuid::Uuid;
 
@@ -109,10 +109,11 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
         )
         .map_err(display_error)?,
     );
-    let mut consumer = HindsightConsumer::new_with_render_profile(
+    let mut consumer = HindsightConsumer::new_with_render_profile_and_observation_scopes(
         config.receipt_root,
         config.hindsight_bank.clone(),
         config.render_profile,
+        config.observation_scopes,
         runner,
     )
     .map_err(display_error)?;
@@ -182,6 +183,7 @@ struct ControllerConfig {
     reconcile_passes: u32,
     consumer_id: String,
     render_profile: HindsightRenderProfile,
+    observation_scopes: Option<HindsightObservationScopes>,
     include_manifest: Option<PathBuf>,
 }
 
@@ -262,6 +264,12 @@ impl ControllerConfig {
                 &values
                     .remove("--render-profile")
                     .unwrap_or_else(|| "legacy-v1".to_owned()),
+            )
+            .map_err(display_error)?,
+            observation_scopes: HindsightObservationScopes::from_name(
+                &values
+                    .remove("--observation-scopes")
+                    .unwrap_or_else(|| "default".to_owned()),
             )
             .map_err(display_error)?,
             include_manifest: values
@@ -424,5 +432,6 @@ fn usage() -> &'static str {
   --hash-budget-bytes N --max-candidate-bytes N --max-deliveries N \
   --max-payload-bytes N --lease-duration-ms N [--reconcile-passes N] [--consumer-id ID] \
   [--render-profile legacy-v1|reference-message-v2|reference-tool-aware-v2] \
+  [--observation-scopes default|per_tag|combined|all_combinations|shared] \
   [--include-manifest ABSOLUTE_PATH]"#
 }

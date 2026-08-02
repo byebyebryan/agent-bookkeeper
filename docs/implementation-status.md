@@ -127,7 +127,10 @@ ID, canonical revision, event, logical location, session metadata, renderer
 profile and filter counts, plus a conservative agent/workspace tag. A revision
 update uses Hindsight's `replace` upsert mode; a retry after a lost Bookkeeper
 acknowledgement is therefore safe. A durable receipt is written only after the
-HTTP retain request succeeds.
+HTTP retain request succeeds. An operator may pass `--observation-scopes` to
+set Hindsight's explicit consolidation boundary for that replay; the setting is
+included in the request and receipt, while the default leaves the Hindsight
+server default unchanged.
 
 `agent-bookkeeper-hindsight-controller` uses the same bounded reconciliation
 and delivery limits as the MemPalace controller, but owns a distinct consumer

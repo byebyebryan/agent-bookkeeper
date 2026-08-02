@@ -31,6 +31,42 @@ pub struct HindsightRetainRequest {
     pub timestamp: Option<String>,
     pub metadata: BTreeMap<String, String>,
     pub tags: Vec<String>,
+    pub observation_scopes: Option<HindsightObservationScopes>,
+}
+
+/// Controls how Hindsight may group source facts during observation
+/// consolidation. `None` deliberately leaves Hindsight's server default in
+/// effect, preserving existing consumer behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HindsightObservationScopes {
+    PerTag,
+    Combined,
+    AllCombinations,
+    Shared,
+}
+
+impl HindsightObservationScopes {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PerTag => "per_tag",
+            Self::Combined => "combined",
+            Self::AllCombinations => "all_combinations",
+            Self::Shared => "shared",
+        }
+    }
+
+    pub fn from_name(value: &str) -> Result<Option<Self>, HindsightConsumerError> {
+        match value {
+            "default" => Ok(None),
+            "per_tag" => Ok(Some(Self::PerTag)),
+            "combined" => Ok(Some(Self::Combined)),
+            "all_combinations" => Ok(Some(Self::AllCombinations)),
+            "shared" => Ok(Some(Self::Shared)),
+            _ => Err(HindsightConsumerError::InvalidConfiguration(format!(
+                "unknown Hindsight observation scopes {value:?}; expected default, per_tag, combined, all_combinations, or shared"
+            ))),
+        }
+    }
 }
 
 /// The subset of a retain result needed in a durable Bookkeeper receipt.
@@ -144,17 +180,21 @@ impl HindsightRunner for HindsightHttpRunner {
         &mut self,
         request: &HindsightRetainRequest,
     ) -> Result<HindsightRetainResponse, String> {
+        let mut item = json!({
+            "content": request.content,
+            "context": request.context,
+            "document_id": request.document_id,
+            "metadata": request.metadata,
+            "tags": request.tags,
+            "timestamp": request.timestamp,
+            "update_mode": "replace",
+        });
+        if let Some(observation_scopes) = request.observation_scopes {
+            item["observation_scopes"] = Value::String(observation_scopes.name().to_owned());
+        }
         let body = serde_json::to_string(&json!({
             "async": false,
-            "items": [{
-                "content": request.content,
-                "context": request.context,
-                "document_id": request.document_id,
-                "metadata": request.metadata,
-                "tags": request.tags,
-                "timestamp": request.timestamp,
-                "update_mode": "replace",
-            }],
+            "items": [item],
         }))
         .map_err(|error| format!("could not serialize Hindsight retain request: {error}"))?;
         let response = self
@@ -198,6 +238,7 @@ pub struct HindsightConsumer<R> {
     receipt_root: PathBuf,
     bank_id: String,
     render_profile: HindsightRenderProfile,
+    observation_scopes: Option<HindsightObservationScopes>,
     runner: R,
 }
 
@@ -221,6 +262,22 @@ impl<R> HindsightConsumer<R> {
         render_profile: HindsightRenderProfile,
         runner: R,
     ) -> Result<Self, HindsightConsumerError> {
+        Self::new_with_render_profile_and_observation_scopes(
+            receipt_root,
+            bank_id,
+            render_profile,
+            None,
+            runner,
+        )
+    }
+
+    pub fn new_with_render_profile_and_observation_scopes(
+        receipt_root: impl Into<PathBuf>,
+        bank_id: impl Into<String>,
+        render_profile: HindsightRenderProfile,
+        observation_scopes: Option<HindsightObservationScopes>,
+        runner: R,
+    ) -> Result<Self, HindsightConsumerError> {
         let receipt_root = receipt_root.into();
         if !receipt_root.is_absolute() {
             return Err(HindsightConsumerError::InvalidConfiguration(
@@ -240,6 +297,7 @@ impl<R> HindsightConsumer<R> {
             receipt_root,
             bank_id,
             render_profile,
+            observation_scopes,
             runner,
         })
     }
@@ -282,6 +340,7 @@ impl<R: HindsightRunner> HindsightConsumer<R> {
                 &source_id,
                 &self.bank_id,
                 self.render_profile,
+                self.observation_scopes,
                 None,
             );
             let existing = fs::read(&destination)?;
@@ -302,6 +361,7 @@ impl<R: HindsightRunner> HindsightConsumer<R> {
                 &self.bank_id,
                 source_id.clone(),
                 self.render_profile,
+                self.observation_scopes,
                 transcript,
             )?;
             Some(
@@ -318,6 +378,7 @@ impl<R: HindsightRunner> HindsightConsumer<R> {
             &source_id,
             &self.bank_id,
             self.render_profile,
+            self.observation_scopes,
             response
                 .as_ref()
                 .and_then(|value| value.operation_id.as_deref()),
@@ -993,6 +1054,7 @@ fn retain_request(
     bank_id: &str,
     source_id: String,
     render_profile: HindsightRenderProfile,
+    observation_scopes: Option<HindsightObservationScopes>,
     transcript: CodexTranscript,
 ) -> Result<HindsightRetainRequest, HindsightConsumerError> {
     let mut metadata = BTreeMap::from([
@@ -1101,6 +1163,7 @@ fn retain_request(
         timestamp: transcript.last_timestamp,
         metadata,
         tags: vec!["agent:codex".to_owned(), format!("workspace:{workspace}")],
+        observation_scopes,
     })
 }
 
@@ -1178,6 +1241,7 @@ fn receipt_bytes(
     source_id: &str,
     bank_id: &str,
     render_profile: HindsightRenderProfile,
+    observation_scopes: Option<HindsightObservationScopes>,
     operation_id: Option<&str>,
 ) -> Vec<u8> {
     let location = delivery.location.as_ref().map(|location| {
@@ -1193,7 +1257,7 @@ fn receipt_bytes(
             "digest": value.digest_hex(),
         })
     });
-    let mut output = serde_json::to_vec(&json!({
+    let mut receipt = json!({
         "format_version": 1,
         "consumer": "hindsight",
         "subscription_id": delivery.subscription_id.as_uuid().to_string(),
@@ -1210,8 +1274,11 @@ fn receipt_bytes(
         "operation_id": operation_id,
         "location": location,
         "payload": payload,
-    }))
-    .expect("JSON values serialize without error");
+    });
+    if let Some(observation_scopes) = observation_scopes {
+        receipt["observation_scopes"] = Value::String(observation_scopes.name().to_owned());
+    }
+    let mut output = serde_json::to_vec(&receipt).expect("JSON values serialize without error");
     output.push(b'\n');
     output
 }
@@ -1275,8 +1342,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        HindsightConsumer, HindsightRenderProfile, HindsightRetainRequest, HindsightRetainResponse,
-        HindsightRunner, parse_codex_transcript,
+        HindsightConsumer, HindsightObservationScopes, HindsightRenderProfile,
+        HindsightRetainRequest, HindsightRetainResponse, HindsightRunner, parse_codex_transcript,
     };
     use crate::catalog::Catalog;
     use crate::controller::{ControlledRunLimits, DeliveryRoots, run_path_consumer};
@@ -1354,7 +1421,14 @@ mod tests {
         )
         .unwrap();
         let runner = RecordingRunner::default();
-        let mut consumer = HindsightConsumer::new(&receipt_root, "codex-pilot", runner).unwrap();
+        let mut consumer = HindsightConsumer::new_with_render_profile_and_observation_scopes(
+            &receipt_root,
+            "codex-pilot",
+            HindsightRenderProfile::LegacyV1,
+            Some(HindsightObservationScopes::Shared),
+            runner,
+        )
+        .unwrap();
 
         let report = run_path_consumer(
             &mut catalog,
@@ -1387,6 +1461,10 @@ mod tests {
             Some("session-a")
         );
         assert_eq!(request.tags, vec!["agent:codex", "workspace:example"]);
+        assert_eq!(
+            request.observation_scopes,
+            Some(HindsightObservationScopes::Shared)
+        );
         let subscription_root = fs::read_dir(&receipt_root)
             .unwrap()
             .next()
@@ -1404,6 +1482,7 @@ mod tests {
         .unwrap();
         assert!(receipt.contains("\"consumer\":\"hindsight\""));
         assert!(receipt.contains("\"operation_id\":\"operation-1\""));
+        assert!(receipt.contains("\"observation_scopes\":\"shared\""));
         assert!(receipt.contains(&revision.digest_hex()));
     }
 

@@ -37,7 +37,8 @@ pub use domain::{
 pub use evidence::{EvidenceConsumerError, FilesystemEvidenceConsumer};
 pub use hindsight::{
     HindsightConsumer, HindsightConsumerError, HindsightHttpConfig, HindsightHttpRunner,
-    HindsightRenderProfile, HindsightRetainRequest, HindsightRetainResponse, HindsightRunner,
+    HindsightObservationScopes, HindsightRenderProfile, HindsightRetainRequest,
+    HindsightRetainResponse, HindsightRunner,
 };
 pub use measurement::{
     MeasurementError, ProcessResources, ReconcileMeasurement, ResourceDelta, ScrubMeasurement,
