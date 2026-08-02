@@ -14,7 +14,7 @@ use crate::domain::{
     RecordId, RecordIdentity, RecordState, RevisionId,
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Deployment-scoped provenance for one reconciled filesystem source.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1692,6 +1692,26 @@ fn migrate(connection: &mut Connection) -> Result<(), CatalogError> {
             params![7, now_ms()?],
         )?;
     }
+    if found < 8 {
+        transaction.execute_batch(
+            "ALTER TABLE subscriptions ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 8 CHECK(max_attempts > 0);
+             ALTER TABLE subscriptions ADD COLUMN initial_backoff_ms INTEGER NOT NULL DEFAULT 1000 CHECK(initial_backoff_ms >= 0);
+             ALTER TABLE subscriptions ADD COLUMN max_backoff_ms INTEGER NOT NULL DEFAULT 60000 CHECK(max_backoff_ms >= initial_backoff_ms);",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",
+            params![8, now_ms()?],
+        )?;
+    }
+    if found < 9 {
+        transaction.execute_batch(
+            "ALTER TABLE deliveries ADD COLUMN not_before_ms INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",
+            params![9, now_ms()?],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -1966,7 +1986,7 @@ mod tests {
     #[test]
     fn schema_and_unchanged_observation_are_stable() {
         let mut catalog = Catalog::open_in_memory().unwrap();
-        assert_eq!(catalog.schema_version().unwrap(), 7);
+        assert_eq!(catalog.schema_version().unwrap(), 9);
         let identity = identity();
         let revision = CanonicalRevision::from_bytes(b"first\n");
 

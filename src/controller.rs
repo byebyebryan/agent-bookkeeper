@@ -287,7 +287,7 @@ mod tests {
         run_path_consumer,
     };
     use crate::catalog::Catalog;
-    use crate::delivery::{DeliveryLease, SubscriptionConfig, SubscriptionMode};
+    use crate::delivery::{DeliveryLease, RetryPolicy, SubscriptionConfig, SubscriptionMode};
     use crate::domain::{
         CanonicalRevision, DeliveryOutcome, LogicalLocation, ProducerId, RecordIdentity,
     };
@@ -348,7 +348,9 @@ mod tests {
         let mut catalog = Catalog::open_in_memory().unwrap();
         let subscription = catalog
             .create_subscription(
-                SubscriptionConfig::new("fixture", 1, true, true).unwrap(),
+                SubscriptionConfig::new("fixture", 1, true, true)
+                    .unwrap()
+                    .with_retry_policy(RetryPolicy::new(8, 0, 0).unwrap()),
                 SubscriptionMode::ReplayEvents,
                 0,
             )
@@ -426,7 +428,9 @@ mod tests {
         let mut catalog = Catalog::open_in_memory().unwrap();
         let subscription = catalog
             .create_subscription(
-                SubscriptionConfig::new("fixture", 1, true, true).unwrap(),
+                SubscriptionConfig::new("fixture", 1, true, true)
+                    .unwrap()
+                    .with_retry_policy(RetryPolicy::new(8, 0, 0).unwrap()),
                 SubscriptionMode::ReplayEvents,
                 0,
             )

@@ -80,6 +80,54 @@ pub struct SubscriptionConfig {
     accepts_moves: bool,
     accepts_tombstones: bool,
     replay_after_sequence: u64,
+    retry_policy: RetryPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryPolicy {
+    max_attempts: u32,
+    initial_backoff_ms: u64,
+    max_backoff_ms: u64,
+}
+
+impl RetryPolicy {
+    pub fn new(
+        max_attempts: u32,
+        initial_backoff_ms: u64,
+        max_backoff_ms: u64,
+    ) -> Result<Self, DeliveryError> {
+        if max_attempts == 0 || max_backoff_ms < initial_backoff_ms {
+            return Err(DeliveryError::InvalidSubscription(
+                "retry policy requires positive attempts and max_backoff_ms >= initial_backoff_ms"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self {
+            max_attempts,
+            initial_backoff_ms,
+            max_backoff_ms,
+        })
+    }
+
+    pub fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+    pub fn initial_backoff_ms(self) -> u64 {
+        self.initial_backoff_ms
+    }
+    pub fn max_backoff_ms(self) -> u64 {
+        self.max_backoff_ms
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 8,
+            initial_backoff_ms: 1_000,
+            max_backoff_ms: 60_000,
+        }
+    }
 }
 
 impl SubscriptionConfig {
@@ -107,6 +155,7 @@ impl SubscriptionConfig {
             accepts_moves,
             accepts_tombstones,
             replay_after_sequence: 0,
+            retry_policy: RetryPolicy::default(),
         })
     }
 
@@ -119,6 +168,11 @@ impl SubscriptionConfig {
 
     pub fn replay_after_sequence(&self) -> u64 {
         self.replay_after_sequence
+    }
+
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
     }
 }
 
@@ -220,8 +274,9 @@ impl Catalog {
         transaction.execute(
             "INSERT INTO subscriptions (
                 id, consumer_id, mode, max_active_leases, accepts_moves,
-                accepts_tombstones, created_at_ms, enabled
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+                accepts_tombstones, created_at_ms, enabled, max_attempts,
+                initial_backoff_ms, max_backoff_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10)",
             params![
                 subscription.id.as_uuid().as_bytes(),
                 subscription.consumer_id,
@@ -230,6 +285,12 @@ impl Catalog {
                 i64::from(config.accepts_moves),
                 i64::from(config.accepts_tombstones),
                 created_at_ms,
+                i64::from(config.retry_policy.max_attempts),
+                as_i64(
+                    config.retry_policy.initial_backoff_ms,
+                    "initial retry backoff"
+                )?,
+                as_i64(config.retry_policy.max_backoff_ms, "maximum retry backoff")?,
             ],
         )?;
 
@@ -350,7 +411,7 @@ impl Catalog {
                  FROM deliveries AS d
                  LEFT JOIN revisions AS rv ON rv.id = d.revision_id
                  WHERE d.subscription_id = ?1
-                   AND d.state = 'queued'
+                   AND d.state = 'queued' AND d.not_before_ms <= ?2
                    AND NOT EXISTS (
                        SELECT 1 FROM deliveries AS prior
                        WHERE prior.subscription_id = d.subscription_id
@@ -361,7 +422,7 @@ impl Catalog {
                  ORDER BY CASE WHEN d.event_sequence IS NULL THEN 1 ELSE 0 END,
                           d.event_sequence ASC, d.id ASC
                  LIMIT 1",
-                params![subscription_id.as_uuid().as_bytes()],
+                params![subscription_id.as_uuid().as_bytes(), now_ms],
                 delivery_candidate_from_row,
             )
             .optional()?;
@@ -435,9 +496,15 @@ impl Catalog {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let admission = subscription_admission(&transaction, lease.subscription_id)?;
+        let not_before_ms = retry_not_before_ms(&admission.retry_policy, lease.attempt, now_ms)?;
         let changed = transaction.execute(
             "UPDATE deliveries
-             SET state = 'queued', lease_token = NULL, lease_expires_at_ms = NULL
+             SET state = CASE WHEN attempts >= ?5 THEN 'dead_lettered' ELSE 'queued' END,
+                 lease_token = NULL, lease_expires_at_ms = NULL,
+                 not_before_ms = CASE WHEN attempts >= ?5 THEN not_before_ms ELSE ?6 END,
+                 settled_at_ms = CASE WHEN attempts >= ?5 THEN ?4 ELSE NULL END,
+                 settlement_reason = CASE WHEN attempts >= ?5 THEN 'retry policy exhausted' ELSE NULL END
              WHERE id = ?1 AND subscription_id = ?2 AND state = 'leased'
                AND lease_token = ?3 AND lease_expires_at_ms > ?4",
             params![
@@ -445,6 +512,8 @@ impl Catalog {
                 lease.subscription_id.as_uuid().as_bytes(),
                 lease.token.as_uuid().as_bytes(),
                 now_ms,
+                i64::from(admission.retry_policy.max_attempts),
+                not_before_ms,
             ],
         )?;
         if changed != 1 {
@@ -513,7 +582,8 @@ pub(crate) fn enqueue_event_for_active_subscriptions(
     event: &ArchiveEvent,
 ) -> Result<(), CatalogError> {
     let mut statement = transaction.prepare(
-        "SELECT id, consumer_id, max_active_leases, accepts_moves, accepts_tombstones
+        "SELECT id, consumer_id, max_active_leases, accepts_moves, accepts_tombstones,
+                max_attempts, initial_backoff_ms, max_backoff_ms
          FROM subscriptions",
     )?;
     let subscriptions = statement
@@ -529,6 +599,14 @@ pub(crate) fn enqueue_event_for_active_subscriptions(
                 accepts_moves: row.get::<_, i64>(3)? != 0,
                 accepts_tombstones: row.get::<_, i64>(4)? != 0,
                 replay_after_sequence: 0,
+                retry_policy: RetryPolicy::new(
+                    u32::try_from(row.get::<_, i64>(5)?).map_err(|_| {
+                        to_sql_error(DeliveryError::Corrupt("invalid max attempts".to_owned()))
+                    })?,
+                    as_u64(row.get::<_, i64>(6)?, "initial retry backoff")?,
+                    as_u64(row.get::<_, i64>(7)?, "maximum retry backoff")?,
+                )
+                .map_err(to_sql_error)?,
             };
             Ok((id, config))
         })?
@@ -599,24 +677,32 @@ fn subscription_admission(
     connection: &rusqlite::Connection,
     subscription_id: SubscriptionId,
 ) -> Result<SubscriptionAdmission, DeliveryError> {
-    let (max_active_leases, enabled) = connection
+    let (max_active_leases, enabled, max_attempts, initial_backoff_ms, max_backoff_ms) = connection
         .query_row(
-            "SELECT max_active_leases, enabled FROM subscriptions WHERE id = ?1",
+            "SELECT max_active_leases, enabled, max_attempts, initial_backoff_ms, max_backoff_ms FROM subscriptions WHERE id = ?1",
             params![subscription_id.as_uuid().as_bytes()],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?)),
         )
         .optional()?
         .ok_or(DeliveryError::UnknownSubscription)?;
     let max_active_leases = u32::try_from(max_active_leases)
         .map_err(|_| DeliveryError::Corrupt("invalid max_active_leases".to_owned()))?;
+    let retry_policy = RetryPolicy::new(
+        u32::try_from(max_attempts)
+            .map_err(|_| DeliveryError::Corrupt("invalid max attempts".to_owned()))?,
+        as_u64(initial_backoff_ms, "initial retry backoff")?,
+        as_u64(max_backoff_ms, "maximum retry backoff")?,
+    )?;
     match enabled {
         0 => Ok(SubscriptionAdmission {
             max_active_leases,
             enabled: false,
+            retry_policy,
         }),
         1 => Ok(SubscriptionAdmission {
             max_active_leases,
             enabled: true,
+            retry_policy,
         }),
         _ => Err(DeliveryError::Corrupt(
             "invalid subscription enabled value".to_owned(),
@@ -628,6 +714,7 @@ fn subscription_admission(
 struct SubscriptionAdmission {
     max_active_leases: u32,
     enabled: bool,
+    retry_policy: RetryPolicy,
 }
 
 fn outcome_state(outcome: DeliveryOutcome) -> DeliveryState {
@@ -637,6 +724,22 @@ fn outcome_state(outcome: DeliveryOutcome) -> DeliveryState {
         DeliveryOutcome::IgnoredByPolicy => DeliveryState::IgnoredByPolicy,
         DeliveryOutcome::DeadLettered => DeliveryState::DeadLettered,
     }
+}
+
+fn retry_not_before_ms(
+    policy: &RetryPolicy,
+    attempt: u32,
+    now_ms: i64,
+) -> Result<i64, DeliveryError> {
+    let shift = attempt.saturating_sub(1).min(63);
+    let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let delay = policy
+        .initial_backoff_ms
+        .saturating_mul(multiplier)
+        .min(policy.max_backoff_ms);
+    now_ms
+        .checked_add(i64::try_from(delay).map_err(|_| DeliveryError::InvalidLeaseDuration)?)
+        .ok_or(DeliveryError::InvalidLeaseDuration)
 }
 
 #[derive(Clone, Debug)]
@@ -832,7 +935,7 @@ pub enum DeliveryError {
 
 #[cfg(test)]
 mod tests {
-    use super::{SubscriptionConfig, SubscriptionMode};
+    use super::{RetryPolicy, SubscriptionConfig, SubscriptionMode};
     use crate::catalog::Catalog;
     use crate::domain::{
         CanonicalRevision, DeliveryOutcome, EventKind, LogicalLocation, ProducerId, RecordIdentity,
@@ -1028,6 +1131,71 @@ mod tests {
             .unwrap();
 
         assert!(catalog.lease_next(subscription.id, 20, 0).is_err());
+    }
+
+    #[test]
+    fn retry_policy_applies_exponential_backoff_then_dead_letters() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let subscription = catalog
+            .create_subscription(
+                config().with_retry_policy(RetryPolicy::new(3, 10, 40).unwrap()),
+                SubscriptionMode::ReplayEvents,
+                0,
+            )
+            .unwrap();
+        let identity = identity();
+        catalog
+            .observe_present_at(
+                &identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"first\n"),
+                10,
+            )
+            .unwrap();
+
+        let first = catalog
+            .lease_next(subscription.id, 20, 100)
+            .unwrap()
+            .unwrap();
+        catalog.retry_delivery(&first, 20).unwrap();
+        assert!(
+            catalog
+                .lease_next(subscription.id, 29, 100)
+                .unwrap()
+                .is_none()
+        );
+        let second = catalog
+            .lease_next(subscription.id, 30, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.attempt, 2);
+        catalog.retry_delivery(&second, 30).unwrap();
+        assert!(
+            catalog
+                .lease_next(subscription.id, 49, 100)
+                .unwrap()
+                .is_none()
+        );
+        let third = catalog
+            .lease_next(subscription.id, 50, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.attempt, 3);
+        catalog.retry_delivery(&third, 50).unwrap();
+
+        assert!(
+            catalog
+                .lease_next(subscription.id, 100, 100)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            catalog
+                .delivery_counts(subscription.id)
+                .unwrap()
+                .dead_lettered,
+            1
+        );
     }
 
     #[test]

@@ -125,6 +125,14 @@ recognized lease/partial filenames at next controlled startup. It does not yet
 have a reusable shared-entry index. The controller is a proof harness, not a
 daemon, schedule, or real archive adapter.
 
+## Implemented in progress: durable retry admission
+
+Subscriptions now persist a retry limit plus initial and capped maximum backoff.
+An explicit retry keeps its `(subscription_id, event_id)` identity, becomes
+leaseable only after the capped exponential delay, and transitions to a durable
+dead letter once the configured attempt limit is reached. Dead letters retain
+their existing per-record ordering-barrier behavior.
+
 ## Implemented in progress: status and recovery-set proof
 
 The library exposes a content-free catalog status snapshot with archive event
@@ -144,11 +152,9 @@ revision, and event state.
 
 1. Finish source operational proof: recorded representative large-record
    measurements and source health/readiness integration for deployment.
-2. Finish payload and delivery: consumer policy (retry/backoff, filters, and
-   explicit unavailable-revision policy), cross-process-safe cache reclamation,
-   and a real adapter boundary.
-3. Operational proof: cache crash reclamation, retry/backoff policy, and a
-   controlled evidence-consumer cohort.
+2. Finish payload and delivery: consumer filters, explicit unavailable-revision
+   policy, and a real adapter boundary.
+3. Operational proof: a controlled evidence-consumer cohort.
 
 ## Validation
 

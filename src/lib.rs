@@ -24,8 +24,8 @@ pub use controller::{
     ControllerError, DeliveryRoots, PathConsumer, run_path_consumer,
 };
 pub use delivery::{
-    DeliveryCounts, DeliveryError, DeliveryLease, DeliveryState, LeaseToken, Subscription,
-    SubscriptionConfig, SubscriptionId, SubscriptionMode,
+    DeliveryCounts, DeliveryError, DeliveryLease, DeliveryState, LeaseToken, RetryPolicy,
+    Subscription, SubscriptionConfig, SubscriptionId, SubscriptionMode,
 };
 pub use domain::{
     ArchiveEvent, CanonicalRevision, DeliveryOutcome, DomainError, EventKind, LogicalLocation,
