@@ -68,20 +68,42 @@ The catalog now materializes one delivery ledger per subscription epoch:
   scheduler pass has not yet run.
 
 This is the durable queue and lease core, not an assertion that an external
-consumer is ready. Materialization, consumer policy, pause/resume control, and
-an adapter run loop remain deliberately outside this slice.
+consumer is ready. Consumer policy beyond capability declarations and a real
+deployment adapter remain deliberately outside this slice.
+
+## Implemented in progress: bounded path-consumer proof
+
+The reference controller now provides a deliberately synchronous, explicit
+controlled-run helper rather than a background mining worker:
+
+- a subscription can be paused/resumed durably and a replay epoch can begin
+  strictly after a selected archive event sequence;
+- each run has a delivery count, payload-byte, and lease-duration bound;
+- byte-bearing deliveries resolve only a configured logical root, then stream
+  into a unique, read-only, lease-scoped materialization cache entry;
+- the source pathname is never exposed to a path-only adapter;
+- unavailable or changed external bytes, adapter failures, and byte-budget
+  deferral return the delivery to `queued` and are represented in the run
+  report; one run stops after a retry to avoid a tight failure loop;
+- an idempotent fake adapter proves a durable external effect is not duplicated
+  when the acknowledgement is lost and the same event is redelivered.
+
+The cache is derived, process-owned controller state. It has per-entry and
+active entry/byte admission limits, but not yet cross-process reclamation or a
+reusable shared-entry index. The controller is a proof harness, not a daemon,
+schedule, or real archive adapter.
 
 ## Remaining V1.5 slices
 
 1. Finish source operational proof: a resumable byte-budgeted integrity scrub,
    scan/source health status, source-level resource limits, and representative
    large-record measurements.
-2. Finish payload and delivery: bounded materialization for path-only consumers,
-   consumer policy and pause/resume, an idempotent fake consumer, and a
-   controlled adapter run loop.
-3. Operational proof: status, SQLite-aware backup/restore, resource controls,
-   representative large-record measurements, and a controlled evidence-consumer
-   cohort.
+2. Finish payload and delivery: consumer policy (retry/backoff, filters, and
+   explicit unavailable-revision policy), cross-process-safe cache reclamation,
+   and a real adapter boundary.
+3. Operational proof: status, SQLite-aware backup/restore, source and consumer
+   resource controls, representative large-record measurements, and a
+   controlled evidence-consumer cohort.
 
 ## Validation
 

@@ -71,6 +71,13 @@ to the filesystem. It is not canonical archive storage and is bounded by bytes,
 entries, and age. A multi-gigabyte path consumer therefore incurs temporary
 materialization cost, but not permanent full-file storage for every revision.
 
+The initial V1.5 reference implementation uses a distinct read-only file per
+lease, keyed with the canonical digest plus a lease nonce, and releases it with
+the delivery attempt. It enforces in-process active-entry and active-byte
+limits. Reuse across controller processes and crash reclamation are operational
+closure work; an incomplete or unowned cache entry is never treated as payload
+evidence.
+
 Adapters that accept a stream or inherited file descriptor avoid this cache.
 
 ## Delivery ordering

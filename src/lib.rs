@@ -6,6 +6,7 @@
 //! can be built.
 
 pub mod catalog;
+pub mod controller;
 pub mod delivery;
 pub mod domain;
 pub mod payload;
@@ -15,6 +16,10 @@ pub use catalog::{
     Catalog, CatalogError, CurrentRecord, SourceFingerprint, SourceRegistration, SourceScan,
     TombstoneGrace,
 };
+pub use controller::{
+    ControlledDeliveryAttempt, ControlledDeliveryOutcome, ControlledRunLimits, ControlledRunReport,
+    ControllerError, DeliveryRoots, PathConsumer, run_path_consumer,
+};
 pub use delivery::{
     DeliveryCounts, DeliveryError, DeliveryLease, DeliveryState, LeaseToken, Subscription,
     SubscriptionConfig, SubscriptionId, SubscriptionMode,
@@ -23,7 +28,10 @@ pub use domain::{
     ArchiveEvent, CanonicalRevision, DeliveryOutcome, DomainError, EventKind, LogicalLocation,
     ProducerId, RecordIdentity, RecordState,
 };
-pub use payload::{CurrentExternalRevision, PayloadError, VerifiedReader};
+pub use payload::{
+    CurrentExternalRevision, MaterializationCache, MaterializationLimits, MaterializedLease,
+    PayloadError, VerifiedReader,
+};
 pub use source_fs::{
     Blake3RevisionHasher, CodexRolloutLayout, DeletionMode, IdentitySchema, LayoutPlugin,
     ReconcileReport, Reconciler, RootGuard, SourceConfig, SourceError, SourceRoot, StabilityPolicy,

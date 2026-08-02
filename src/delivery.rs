@@ -69,6 +69,7 @@ pub struct SubscriptionConfig {
     max_active_leases: u32,
     accepts_moves: bool,
     accepts_tombstones: bool,
+    replay_after_sequence: u64,
 }
 
 impl SubscriptionConfig {
@@ -95,7 +96,19 @@ impl SubscriptionConfig {
             max_active_leases,
             accepts_moves,
             accepts_tombstones,
+            replay_after_sequence: 0,
         })
+    }
+
+    /// Limits an initial `replay_events` epoch to events strictly after this
+    /// durable archive sequence. Live events are still appended normally.
+    pub fn with_replay_after_sequence(mut self, sequence: u64) -> Self {
+        self.replay_after_sequence = sequence;
+        self
+    }
+
+    pub fn replay_after_sequence(&self) -> u64 {
+        self.replay_after_sequence
     }
 }
 
@@ -104,6 +117,8 @@ pub struct Subscription {
     pub id: SubscriptionId,
     pub consumer_id: String,
     pub mode: SubscriptionMode,
+    pub replay_after_sequence: u64,
+    pub enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,12 +204,14 @@ impl Catalog {
             id: SubscriptionId::new(),
             consumer_id: config.consumer_id.clone(),
             mode,
+            replay_after_sequence: config.replay_after_sequence,
+            enabled: true,
         };
         transaction.execute(
             "INSERT INTO subscriptions (
                 id, consumer_id, mode, max_active_leases, accepts_moves,
-                accepts_tombstones, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                accepts_tombstones, created_at_ms, enabled
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
             params![
                 subscription.id.as_uuid().as_bytes(),
                 subscription.consumer_id,
@@ -211,10 +228,16 @@ impl Catalog {
                 let mut statement = transaction.prepare(
                     "SELECT id, sequence, record_id, record_version, kind, revision_id,
                             root_role, source_relative_path, committed_at_ms
-                     FROM events ORDER BY sequence ASC",
+                     FROM events WHERE sequence > ?1 ORDER BY sequence ASC",
                 )?;
                 let events = statement
-                    .query_map([], event_from_row)?
+                    .query_map(
+                        params![as_i64(
+                            config.replay_after_sequence,
+                            "replay event sequence"
+                        )?],
+                        event_from_row,
+                    )?
                     .collect::<Result<Vec<_>, _>>()?;
                 drop(statement);
                 for event in events {
@@ -289,7 +312,11 @@ impl Catalog {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let max_active_leases = subscription_max_leases(&transaction, subscription_id)?;
+        let admission = subscription_admission(&transaction, subscription_id)?;
+        if !admission.enabled {
+            transaction.commit()?;
+            return Ok(None);
+        }
         transaction.execute(
             "UPDATE deliveries
              SET state = 'queued', lease_token = NULL, lease_expires_at_ms = NULL
@@ -301,7 +328,7 @@ impl Catalog {
             params![subscription_id.as_uuid().as_bytes()],
             |row| row.get(0),
         )?;
-        if active_leases >= i64::from(max_active_leases) {
+        if active_leases >= i64::from(admission.max_active_leases) {
             transaction.commit()?;
             return Ok(None);
         }
@@ -421,7 +448,7 @@ impl Catalog {
         &self,
         subscription_id: SubscriptionId,
     ) -> Result<DeliveryCounts, DeliveryError> {
-        subscription_max_leases(&self.connection, subscription_id)?;
+        subscription_admission(&self.connection, subscription_id)?;
         let mut counts = DeliveryCounts {
             queued: 0,
             leased: 0,
@@ -452,6 +479,23 @@ impl Catalog {
         }
         Ok(counts)
     }
+
+    /// Pausing is durable and affects only this subscription epoch. Its queued
+    /// work remains in the ledger and becomes leaseable again on resume.
+    pub fn set_subscription_enabled(
+        &mut self,
+        subscription_id: SubscriptionId,
+        enabled: bool,
+    ) -> Result<(), DeliveryError> {
+        let changed = self.connection.execute(
+            "UPDATE subscriptions SET enabled = ?1 WHERE id = ?2",
+            params![i64::from(enabled), subscription_id.as_uuid().as_bytes()],
+        )?;
+        if changed != 1 {
+            return Err(DeliveryError::UnknownSubscription);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn enqueue_event_for_active_subscriptions(
@@ -474,6 +518,7 @@ pub(crate) fn enqueue_event_for_active_subscriptions(
                 })?,
                 accepts_moves: row.get::<_, i64>(3)? != 0,
                 accepts_tombstones: row.get::<_, i64>(4)? != 0,
+                replay_after_sequence: 0,
             };
             Ok((id, config))
         })?
@@ -540,20 +585,39 @@ fn initial_delivery_state(config: &SubscriptionConfig, kind: EventKind) -> Deliv
     }
 }
 
-fn subscription_max_leases(
+fn subscription_admission(
     connection: &rusqlite::Connection,
     subscription_id: SubscriptionId,
-) -> Result<u32, DeliveryError> {
-    let max_active_leases = connection
+) -> Result<SubscriptionAdmission, DeliveryError> {
+    let (max_active_leases, enabled) = connection
         .query_row(
-            "SELECT max_active_leases FROM subscriptions WHERE id = ?1",
+            "SELECT max_active_leases, enabled FROM subscriptions WHERE id = ?1",
             params![subscription_id.as_uuid().as_bytes()],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?
         .ok_or(DeliveryError::UnknownSubscription)?;
-    u32::try_from(max_active_leases)
-        .map_err(|_| DeliveryError::Corrupt("invalid max_active_leases".to_owned()))
+    let max_active_leases = u32::try_from(max_active_leases)
+        .map_err(|_| DeliveryError::Corrupt("invalid max_active_leases".to_owned()))?;
+    match enabled {
+        0 => Ok(SubscriptionAdmission {
+            max_active_leases,
+            enabled: false,
+        }),
+        1 => Ok(SubscriptionAdmission {
+            max_active_leases,
+            enabled: true,
+        }),
+        _ => Err(DeliveryError::Corrupt(
+            "invalid subscription enabled value".to_owned(),
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SubscriptionAdmission {
+    max_active_leases: u32,
+    enabled: bool,
 }
 
 fn outcome_state(outcome: DeliveryOutcome) -> DeliveryState {
@@ -1036,6 +1100,88 @@ mod tests {
         assert!(snapshot.is_snapshot);
         assert_ne!(snapshot.event_id, first.event_id);
         assert_eq!(snapshot.record_id, first.record_id);
+    }
+
+    #[test]
+    fn paused_subscription_keeps_queued_work_without_leasing_it() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let subscription = catalog
+            .create_subscription(config(), SubscriptionMode::ReplayEvents, 0)
+            .unwrap();
+        let identity = identity();
+        catalog
+            .observe_present_at(
+                &identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"first\n"),
+                10,
+            )
+            .unwrap();
+
+        catalog
+            .set_subscription_enabled(subscription.id, false)
+            .unwrap();
+        assert!(
+            catalog
+                .lease_next(subscription.id, 20, 100)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(catalog.delivery_counts(subscription.id).unwrap().queued, 1);
+
+        catalog
+            .set_subscription_enabled(subscription.id, true)
+            .unwrap();
+        assert!(
+            catalog
+                .lease_next(subscription.id, 21, 100)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn replay_after_sequence_skips_old_events_but_subscribes_to_new_ones() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let identity = identity();
+        catalog
+            .observe_present_at(
+                &identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"first\n"),
+                10,
+            )
+            .unwrap();
+        let subscription = catalog
+            .create_subscription(
+                config().with_replay_after_sequence(1),
+                SubscriptionMode::ReplayEvents,
+                20,
+            )
+            .unwrap();
+        assert_eq!(subscription.replay_after_sequence, 1);
+        assert!(
+            catalog
+                .lease_next(subscription.id, 30, 100)
+                .unwrap()
+                .is_none()
+        );
+
+        catalog
+            .observe_present_at(
+                &identity,
+                &location(),
+                CanonicalRevision::from_bytes(b"second\n"),
+                40,
+            )
+            .unwrap();
+        let lease = catalog
+            .lease_next(subscription.id, 50, 100)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(lease.record_version, 2);
+        assert_eq!(lease.event_sequence, Some(2));
     }
 
     #[test]

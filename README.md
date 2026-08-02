@@ -16,9 +16,11 @@ revisions, path-independent identity, moves, rewrites, tombstones/restores, and
 multiple records per session. It also has a guarded read-only filesystem scanner
 with a versioned Codex rollout schema, durable scan state, guarded tombstone
 grace, held-descriptor validation for borrowed source bytes, and a durable
-subscription/lease ledger that preserves per-record version ordering. Integrity
-scrub, materialization, and real consumers remain pending. See
-[implementation status](docs/implementation-status.md).
+subscription/lease ledger that preserves per-record version ordering. A bounded
+path-consumer proof harness creates verified lease-scoped copies instead of
+exposing mutable source paths, and demonstrates idempotent redelivery with a
+fake adapter. Integrity scrub, cache operational closure, and real consumers
+remain pending. See [implementation status](docs/implementation-status.md).
 
 V2's protocol is detailed but intentionally not frozen until the shared V1.5
 domain model passes its gates. The plan is staged:
