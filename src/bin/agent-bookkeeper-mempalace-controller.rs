@@ -10,10 +10,11 @@ use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_bookkeeper::{
-    Catalog, CodexRolloutLayout, ControlledRunLimits, DeletionMode, DeliveryRoots,
-    MaterializationCache, MaterializationLimits, MempalaceCliConfig, MempalaceCommandRunner,
-    MempalaceConsumer, ProducerId, ReconcileReport, Reconciler, SourceConfig, SourceRoot,
-    StabilityPolicy, SubscriptionConfig, SubscriptionMode, catalog_status, run_path_consumer,
+    Catalog, CodexRolloutLayout, ControlledDeliveryAttempt, ControlledDeliveryOutcome,
+    ControlledRunLimits, DeletionMode, DeliveryRoots, MaterializationCache, MaterializationLimits,
+    MempalaceCliConfig, MempalaceCommandRunner, MempalaceConsumer, ProducerId, ReconcileReport,
+    Reconciler, SourceConfig, SourceRoot, StabilityPolicy, SubscriptionConfig, SubscriptionMode,
+    catalog_status, run_path_consumer,
 };
 use uuid::Uuid;
 
@@ -123,6 +124,7 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
             "delivery": {
                 "attempts": delivery_report.attempts.len(),
                 "payload_bytes_admitted": delivery_report.payload_bytes_admitted,
+                "outcomes": delivery_report.attempts.iter().map(delivery_attempt_json).collect::<Vec<_>>(),
             },
             "catalog": {
                 "latest_event_sequence": final_status.latest_event_sequence,
@@ -299,6 +301,29 @@ fn reconcile_totals(reports: &[ReconcileReport]) -> serde_json::Value {
         "changed_during_scan": reports.iter().map(|report| report.changed_during_scan).sum::<u64>(),
         "bytes_hashed": reports.iter().map(|report| report.bytes_hashed).sum::<u64>(),
         "events": reports.iter().map(|report| report.events.len()).sum::<usize>(),
+    })
+}
+
+fn delivery_attempt_json(attempt: &ControlledDeliveryAttempt) -> serde_json::Value {
+    let outcome = match &attempt.outcome {
+        ControlledDeliveryOutcome::Settled(outcome) => {
+            serde_json::json!({"state": "settled", "outcome": format!("{outcome:?}")})
+        }
+        ControlledDeliveryOutcome::Retried { reason } => {
+            serde_json::json!({"state": "retried", "reason": reason})
+        }
+        ControlledDeliveryOutcome::Blocked { reason } => {
+            serde_json::json!({"state": "blocked", "reason": reason})
+        }
+        ControlledDeliveryOutcome::DeferredByByteBudget => {
+            serde_json::json!({"state": "deferred_by_byte_budget"})
+        }
+    };
+    serde_json::json!({
+        "event_id": attempt.event_id.as_uuid().to_string(),
+        "record_id": attempt.record_id.as_uuid().to_string(),
+        "record_version": attempt.record_version,
+        "outcome": outcome,
     })
 }
 
