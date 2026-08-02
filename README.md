@@ -33,11 +33,15 @@ not a standing worker or a general promotion claim.
 The `agent-bookkeeper-mempalace-controller` binary is the corresponding
 explicit one-shot runner. It requires absolute operator-supplied paths, two
 stability scans, a hash budget, a hard per-record cohort limit, a delivery
-count/byte limit, and a local MemPalace CLI. It owns only its SQLite ledger,
-lease cache, and receipts; it never performs client transport or starts a timer.
-`Dockerfile.mempalace-controller` provides an optional image layer: the
-operator pins the base MemPalace image through `MEMPALACE_IMAGE` and supplies
-all runtime paths and limits.
+count/byte limit, and a local MemPalace CLI. The companion
+`agent-bookkeeper-hindsight-controller` drives a synchronous Hindsight retain
+adapter through its HTTP API. It renders only Codex user and assistant messages
+from a verified lease, stamps every retain with record/revision provenance, and
+uses a stable `document_id` so retries replace rather than duplicate learned
+facts. Both controllers own only their SQLite ledger, lease cache, and receipts;
+they never perform client transport or start a timer. The optional Dockerfiles
+provide image layers while the operator supplies all runtime paths, endpoints,
+and limits.
 See [implementation status](docs/implementation-status.md).
 
 V2's protocol is detailed but intentionally not frozen until the shared V1.5
@@ -93,6 +97,7 @@ Inspect controller arguments with:
 
 ```sh
 rtk cargo run --bin agent-bookkeeper-mempalace-controller -- --help
+rtk cargo run --bin agent-bookkeeper-hindsight-controller -- --help
 ```
 
 ## License

@@ -110,6 +110,26 @@ operator-provided active and archived roots twice for stability, applies the
 hard record-size and run budgets, then prints a content-free JSON summary. It
 does not install a timer, perform transport, or start a background worker.
 
+## Implemented in progress: Hindsight learned-memory adapter
+
+`HindsightConsumer` is a separate, synchronous consumer subscription for a
+Hindsight-compatible HTTP API. It re-verifies the materialized lease revision,
+parses the Codex JSONL only enough to render `user_message` and `agent_message`
+events, and deliberately excludes tool calls, tool output, session
+instructions, and mutable source paths. The request carries a stable
+`agent-bookkeeper://record/<record-id>` source/document ID, canonical revision,
+event, logical location, session metadata, and a conservative agent/workspace
+tag. A revision update uses Hindsight's `replace` upsert mode; a retry after a
+lost Bookkeeper acknowledgement is therefore safe. A durable receipt is written
+only after the HTTP retain request succeeds.
+
+`agent-bookkeeper-hindsight-controller` uses the same bounded reconciliation
+and delivery limits as the MemPalace controller, but owns a distinct consumer
+cursor and receipt root. It is intentionally a manual one-shot: service
+unavailability becomes a normal queued retry, not an agent-hook failure. A
+metadata-only tombstone is `ignored_by_policy` because deletion of learned facts
+needs a separately reviewed correction/retention policy.
+
 ## Implemented in progress: verified external payload reader
 
 `CurrentExternalRevision` resolves a configured root-relative file through a
@@ -195,8 +215,8 @@ revision, and event state.
    measurements and source health/readiness integration for deployment.
 2. Finish payload and delivery: consumer filters and explicit
    unavailable-revision policy.
-3. Operational proof: a bounded MemPalace consumer cohort with provenance and
-   retrieval acceptance evidence.
+3. Operational proof: bounded MemPalace and Hindsight consumer cohorts with
+   provenance, retrieval, and learned-memory relevance acceptance evidence.
 
 ## Validation
 

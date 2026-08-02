@@ -1,0 +1,735 @@
+//! A provenance-preserving Hindsight learned-memory consumer.
+//!
+//! This adapter is intentionally downstream of Bookkeeper's verified lease.
+//! It renders only user and assistant Codex messages, sends one replace/upsert
+//! request to Hindsight, and writes an idempotent provenance receipt only after
+//! that request succeeds. Raw JSONL remains outside Hindsight's ownership.
+
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::controller::PathConsumer;
+use crate::delivery::DeliveryLease;
+use crate::domain::{CanonicalRevision, DeliveryOutcome, EventKind};
+
+/// A complete, replayable Hindsight retain call derived from one Bookkeeper
+/// record revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HindsightRetainRequest {
+    pub bank_id: String,
+    pub document_id: String,
+    pub source_id: String,
+    pub content: String,
+    pub context: String,
+    pub timestamp: Option<String>,
+    pub metadata: BTreeMap<String, String>,
+    pub tags: Vec<String>,
+}
+
+/// The subset of a retain result needed in a durable Bookkeeper receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HindsightRetainResponse {
+    pub operation_id: Option<String>,
+}
+
+/// Executes a single synchronous retain request.
+pub trait HindsightRunner {
+    fn retain(
+        &mut self,
+        request: &HindsightRetainRequest,
+    ) -> Result<HindsightRetainResponse, String>;
+}
+
+/// HTTP configuration for a self-hosted Hindsight API.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HindsightHttpConfig {
+    base_url: String,
+    timeout: Duration,
+}
+
+impl HindsightHttpConfig {
+    pub fn new(
+        base_url: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self, HindsightConsumerError> {
+        let base_url = base_url.into();
+        if base_url.is_empty()
+            || base_url.trim() != base_url
+            || base_url.contains('\0')
+            || !(base_url.starts_with("http://") || base_url.starts_with("https://"))
+        {
+            return Err(HindsightConsumerError::InvalidConfiguration(
+                "Hindsight base URL must be a non-empty, trimmed http(s) URL".to_owned(),
+            ));
+        }
+        if timeout.is_zero() {
+            return Err(HindsightConsumerError::InvalidConfiguration(
+                "Hindsight HTTP timeout must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            timeout,
+        })
+    }
+}
+
+/// Small dependency-free-in-policy HTTP implementation of Hindsight's retain
+/// endpoint. The caller supplies only an internal API base URL; no raw source
+/// filesystem path is sent to Hindsight.
+#[derive(Debug)]
+pub struct HindsightHttpRunner {
+    config: HindsightHttpConfig,
+    agent: ureq::Agent,
+}
+
+impl HindsightHttpRunner {
+    pub fn new(config: HindsightHttpConfig) -> Self {
+        let agent = ureq::AgentBuilder::new().timeout(config.timeout).build();
+        Self { config, agent }
+    }
+
+    fn endpoint(&self, bank_id: &str) -> String {
+        format!(
+            "{}/v1/default/banks/{bank_id}/memories",
+            self.config.base_url
+        )
+    }
+}
+
+impl HindsightRunner for HindsightHttpRunner {
+    fn retain(
+        &mut self,
+        request: &HindsightRetainRequest,
+    ) -> Result<HindsightRetainResponse, String> {
+        let body = serde_json::to_string(&json!({
+            "async": false,
+            "items": [{
+                "content": request.content,
+                "context": request.context,
+                "document_id": request.document_id,
+                "metadata": request.metadata,
+                "tags": request.tags,
+                "timestamp": request.timestamp,
+                "update_mode": "replace",
+            }],
+        }))
+        .map_err(|error| format!("could not serialize Hindsight retain request: {error}"))?;
+        let response = self
+            .agent
+            .post(&self.endpoint(&request.bank_id))
+            .set("Content-Type", "application/json")
+            .send_string(&body)
+            .map_err(http_error)?;
+        let status = response.status();
+        let text = response
+            .into_string()
+            .map_err(|error| format!("could not read Hindsight response: {error}"))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("Hindsight returned invalid JSON ({status}): {error}"))?;
+        if value.get("success").and_then(Value::as_bool) == Some(false) {
+            return Err(format!(
+                "Hindsight rejected retain request ({status}): {text}"
+            ));
+        }
+        let operation_id = value
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        Ok(HindsightRetainResponse { operation_id })
+    }
+}
+
+fn http_error(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let body = response.into_string().unwrap_or_default();
+            format!("Hindsight returned HTTP {status}: {}", body.trim())
+        }
+        ureq::Error::Transport(error) => format!("could not reach Hindsight: {error}"),
+    }
+}
+
+/// A durable, idempotent consumer of Codex transcript revisions.
+#[derive(Debug)]
+pub struct HindsightConsumer<R> {
+    receipt_root: PathBuf,
+    bank_id: String,
+    runner: R,
+}
+
+impl<R> HindsightConsumer<R> {
+    pub fn new(
+        receipt_root: impl Into<PathBuf>,
+        bank_id: impl Into<String>,
+        runner: R,
+    ) -> Result<Self, HindsightConsumerError> {
+        let receipt_root = receipt_root.into();
+        if !receipt_root.is_absolute() {
+            return Err(HindsightConsumerError::InvalidConfiguration(
+                "Hindsight receipt root must be absolute".to_owned(),
+            ));
+        }
+        fs::create_dir_all(&receipt_root)?;
+        let metadata = fs::symlink_metadata(&receipt_root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(HindsightConsumerError::InvalidConfiguration(
+                "Hindsight receipt root must be a real directory".to_owned(),
+            ));
+        }
+        let bank_id = bank_id.into();
+        validate_bank_id(&bank_id)?;
+        Ok(Self {
+            receipt_root,
+            bank_id,
+            runner,
+        })
+    }
+
+    pub fn receipt_path(&self, delivery: &DeliveryLease) -> PathBuf {
+        self.receipt_root
+            .join(delivery.subscription_id.as_uuid().hyphenated().to_string())
+            .join(format!("{}.json", delivery.event_id.as_uuid().hyphenated()))
+    }
+
+    pub fn source_id(delivery: &DeliveryLease) -> String {
+        format!("agent-bookkeeper://record/{}", delivery.record_id.as_uuid())
+    }
+}
+
+impl<R: HindsightRunner> HindsightConsumer<R> {
+    fn apply_inner(
+        &mut self,
+        delivery: &DeliveryLease,
+        payload: Option<&Path>,
+    ) -> Result<DeliveryOutcome, HindsightConsumerError> {
+        let payload_revision = match (delivery.revision, payload) {
+            (Some(expected), Some(path)) => {
+                let actual = CanonicalRevision::from_reader(File::open(path)?)?;
+                if actual != expected {
+                    return Err(HindsightConsumerError::ProvenanceMismatch);
+                }
+                Some(actual)
+            }
+            (Some(_), None) => return Err(HindsightConsumerError::MissingPayload),
+            (None, Some(_)) => return Err(HindsightConsumerError::UnexpectedPayload),
+            (None, None) => None,
+        };
+        let source_id = Self::source_id(delivery);
+        let destination = self.receipt_path(delivery);
+        if destination.exists() {
+            let expected =
+                receipt_bytes(delivery, payload_revision, &source_id, &self.bank_id, None);
+            let existing = fs::read(&destination)?;
+            if receipt_matches(&existing, &expected)? {
+                return Ok(receipt_outcome(delivery));
+            }
+            return Err(HindsightConsumerError::IdempotencyConflict(destination));
+        }
+
+        let response = if let Some(revision) = payload_revision {
+            let transcript = parse_codex_transcript(payload.expect("payload matched a revision"))?;
+            let request = retain_request(
+                delivery,
+                revision,
+                &self.bank_id,
+                source_id.clone(),
+                transcript,
+            )?;
+            Some(
+                self.runner
+                    .retain(&request)
+                    .map_err(HindsightConsumerError::Runner)?,
+            )
+        } else {
+            None
+        };
+        let receipt = receipt_bytes(
+            delivery,
+            payload_revision,
+            &source_id,
+            &self.bank_id,
+            response
+                .as_ref()
+                .and_then(|value| value.operation_id.as_deref()),
+        );
+        write_receipt(&destination, &receipt)?;
+        Ok(receipt_outcome(delivery))
+    }
+}
+
+impl<R: HindsightRunner> PathConsumer for HindsightConsumer<R> {
+    fn apply(
+        &mut self,
+        delivery: &DeliveryLease,
+        payload: Option<&Path>,
+    ) -> Result<DeliveryOutcome, String> {
+        self.apply_inner(delivery, payload)
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Debug)]
+struct CodexTranscript {
+    content: String,
+    session_id: Option<String>,
+    session_cwd: Option<String>,
+    last_timestamp: Option<String>,
+}
+
+fn parse_codex_transcript(path: &Path) -> Result<CodexTranscript, HindsightConsumerError> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut messages = Vec::new();
+    let mut session_id = None;
+    let mut session_cwd = None;
+    let mut last_timestamp = None;
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line).map_err(|error| {
+            HindsightConsumerError::InvalidTranscript(format!(
+                "line {} is not valid JSON: {error}",
+                index + 1
+            ))
+        })?;
+        let timestamp = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        match value.get("type").and_then(Value::as_str) {
+            Some("session_meta") => {
+                let payload = value.get("payload").and_then(Value::as_object);
+                session_id = payload
+                    .and_then(|payload| payload.get("session_id").or_else(|| payload.get("id")))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                session_cwd = payload
+                    .and_then(|payload| payload.get("cwd"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+            }
+            Some("event_msg") => {
+                let payload = value.get("payload").and_then(Value::as_object);
+                let Some(message_type) = payload
+                    .and_then(|payload| payload.get("type"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let role = match message_type {
+                    "user_message" => "User",
+                    "agent_message" => "Assistant",
+                    _ => continue,
+                };
+                let Some(message) = payload
+                    .and_then(|payload| payload.get("message"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                if message.trim().is_empty() {
+                    continue;
+                }
+                let rendered_timestamp = timestamp.as_deref().unwrap_or("unknown time");
+                messages.push(format!("{role} ({rendered_timestamp}): {message}"));
+                if timestamp.is_some() {
+                    last_timestamp = timestamp;
+                }
+            }
+            _ => {}
+        }
+    }
+    if messages.is_empty() {
+        return Err(HindsightConsumerError::InvalidTranscript(
+            "contains no user or assistant messages".to_owned(),
+        ));
+    }
+    Ok(CodexTranscript {
+        content: messages.join("\n\n"),
+        session_id,
+        session_cwd,
+        last_timestamp,
+    })
+}
+
+fn retain_request(
+    delivery: &DeliveryLease,
+    revision: CanonicalRevision,
+    bank_id: &str,
+    source_id: String,
+    transcript: CodexTranscript,
+) -> Result<HindsightRetainRequest, HindsightConsumerError> {
+    let mut metadata = BTreeMap::from([
+        ("source_id".to_owned(), source_id.clone()),
+        (
+            "record_id".to_owned(),
+            delivery.record_id.as_uuid().to_string(),
+        ),
+        (
+            "record_version".to_owned(),
+            delivery.record_version.to_string(),
+        ),
+        (
+            "event_id".to_owned(),
+            delivery.event_id.as_uuid().to_string(),
+        ),
+        (
+            "revision_algorithm".to_owned(),
+            CanonicalRevision::ALGORITHM.to_owned(),
+        ),
+        ("revision_digest".to_owned(), revision.digest_hex()),
+        (
+            "revision_byte_length".to_owned(),
+            revision.byte_length().to_string(),
+        ),
+    ]);
+    if let Some(event_sequence) = delivery.event_sequence {
+        metadata.insert("event_sequence".to_owned(), event_sequence.to_string());
+    }
+    if let Some(location) = &delivery.location {
+        metadata.insert("root_role".to_owned(), location.root_role().to_owned());
+        metadata.insert(
+            "source_relative_path".to_owned(),
+            location.source_relative_path().to_owned(),
+        );
+    }
+    if let Some(session_id) = &transcript.session_id {
+        metadata.insert("session_id".to_owned(), session_id.clone());
+    }
+    if let Some(session_cwd) = &transcript.session_cwd {
+        metadata.insert("session_cwd".to_owned(), session_cwd.clone());
+    }
+    let workspace = transcript
+        .session_cwd
+        .as_deref()
+        .and_then(|cwd| Path::new(cwd).file_name())
+        .and_then(|value| value.to_str())
+        .map(workspace_tag)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let mut context = "Codex agent-session transcript".to_owned();
+    if let Some(session_cwd) = transcript.session_cwd.as_deref() {
+        context.push_str(" from workspace ");
+        context.push_str(session_cwd);
+    }
+    Ok(HindsightRetainRequest {
+        bank_id: bank_id.to_owned(),
+        document_id: source_id.clone(),
+        source_id,
+        content: transcript.content,
+        context,
+        timestamp: transcript.last_timestamp,
+        metadata,
+        tags: vec!["agent:codex".to_owned(), format!("workspace:{workspace}")],
+    })
+}
+
+fn workspace_tag(value: &str) -> String {
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    normalized
+        .trim_matches('-')
+        .chars()
+        .take(80)
+        .collect::<String>()
+}
+
+fn validate_bank_id(bank_id: &str) -> Result<(), HindsightConsumerError> {
+    if bank_id.is_empty()
+        || bank_id.trim() != bank_id
+        || !bank_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(HindsightConsumerError::InvalidConfiguration(
+            "Hindsight bank ID must be non-empty, trimmed, and use only ASCII letters, digits, '-', '_', or '.'"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn receipt_outcome(delivery: &DeliveryLease) -> DeliveryOutcome {
+    if delivery.revision.is_some() {
+        DeliveryOutcome::Acknowledged
+    } else {
+        // This pilot deliberately has no destructive learned-memory policy.
+        // A raw archive tombstone does not imply facts should be erased.
+        DeliveryOutcome::IgnoredByPolicy
+    }
+}
+
+fn write_receipt(destination: &Path, receipt: &[u8]) -> Result<(), HindsightConsumerError> {
+    let parent = destination.parent().expect("receipt path has a parent");
+    fs::create_dir_all(parent)?;
+    let filename = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .expect("receipt path has a UTF-8 filename");
+    let temporary = parent.join(format!(".{filename}.{}.partial", Uuid::new_v4()));
+    let result = (|| -> Result<(), HindsightConsumerError> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(receipt)?;
+        file.sync_all()?;
+        fs::rename(&temporary, destination)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn receipt_bytes(
+    delivery: &DeliveryLease,
+    payload: Option<CanonicalRevision>,
+    source_id: &str,
+    bank_id: &str,
+    operation_id: Option<&str>,
+) -> Vec<u8> {
+    let location = delivery.location.as_ref().map(|location| {
+        json!({
+            "root_role": location.root_role(),
+            "source_relative_path": location.source_relative_path(),
+        })
+    });
+    let payload = payload.map(|value| {
+        json!({
+            "algorithm": CanonicalRevision::ALGORITHM,
+            "byte_length": value.byte_length(),
+            "digest": value.digest_hex(),
+        })
+    });
+    let mut output = serde_json::to_vec(&json!({
+        "format_version": 1,
+        "consumer": "hindsight",
+        "subscription_id": delivery.subscription_id.as_uuid().to_string(),
+        "event_id": delivery.event_id.as_uuid().to_string(),
+        "event_idempotency_key": format!("{}:{}", delivery.subscription_id, delivery.event_id.as_uuid()),
+        "event_sequence": delivery.event_sequence,
+        "record_id": delivery.record_id.as_uuid().to_string(),
+        "record_version": delivery.record_version,
+        "event_kind": event_kind_name(delivery.kind),
+        "source_id": source_id,
+        "document_id": source_id,
+        "bank_id": bank_id,
+        "operation_id": operation_id,
+        "location": location,
+        "payload": payload,
+    }))
+    .expect("JSON values serialize without error");
+    output.push(b'\n');
+    output
+}
+
+fn receipt_matches(existing: &[u8], expected: &[u8]) -> Result<bool, HindsightConsumerError> {
+    let mut existing: Value = serde_json::from_slice(existing).map_err(|error| {
+        HindsightConsumerError::InvalidReceipt(format!(
+            "existing receipt is not valid JSON: {error}"
+        ))
+    })?;
+    let mut expected: Value =
+        serde_json::from_slice(expected).expect("generated receipt is valid JSON");
+    existing
+        .as_object_mut()
+        .expect("receipt JSON is an object")
+        .remove("operation_id");
+    expected
+        .as_object_mut()
+        .expect("receipt JSON is an object")
+        .remove("operation_id");
+    Ok(existing == expected)
+}
+
+fn event_kind_name(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::RevisionCommitted => "revision_committed",
+        EventKind::LocationChanged => "location_changed",
+        EventKind::RecordTombstoned => "record_tombstoned",
+        EventKind::RecordRestored => "record_restored",
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum HindsightConsumerError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Domain(#[from] crate::domain::DomainError),
+    #[error("invalid Hindsight consumer configuration: {0}")]
+    InvalidConfiguration(String),
+    #[error("leased payload does not match its declared revision")]
+    ProvenanceMismatch,
+    #[error("byte-bearing delivery has no materialized payload")]
+    MissingPayload,
+    #[error("metadata-only delivery unexpectedly has a payload")]
+    UnexpectedPayload,
+    #[error("Codex transcript cannot be safely rendered for Hindsight: {0}")]
+    InvalidTranscript(String),
+    #[error("existing Hindsight receipt is malformed: {0}")]
+    InvalidReceipt(String),
+    #[error("existing Hindsight receipt conflicts with delivery provenance: {0}")]
+    IdempotencyConflict(PathBuf),
+    #[error("Hindsight runner failed: {0}")]
+    Runner(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{
+        HindsightConsumer, HindsightRetainRequest, HindsightRetainResponse, HindsightRunner,
+    };
+    use crate::catalog::Catalog;
+    use crate::controller::{ControlledRunLimits, DeliveryRoots, run_path_consumer};
+    use crate::delivery::{RetryPolicy, SubscriptionConfig, SubscriptionMode};
+    use crate::domain::{CanonicalRevision, LogicalLocation, ProducerId, RecordIdentity};
+    use crate::payload::{MaterializationCache, MaterializationLimits};
+
+    #[derive(Default)]
+    struct RecordingRunner {
+        requests: Vec<HindsightRetainRequest>,
+    }
+
+    impl HindsightRunner for RecordingRunner {
+        fn retain(
+            &mut self,
+            request: &HindsightRetainRequest,
+        ) -> Result<HindsightRetainResponse, String> {
+            self.requests.push(request.clone());
+            Ok(HindsightRetainResponse {
+                operation_id: Some("operation-1".to_owned()),
+            })
+        }
+    }
+
+    fn identity() -> RecordIdentity {
+        RecordIdentity::new(
+            ProducerId::new(),
+            "codex",
+            "session-a",
+            "transcript",
+            "primary",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn adapter_renders_only_messages_and_writes_a_provenance_receipt() {
+        let directory = tempdir().unwrap();
+        let source_root = directory.path().join("source");
+        let cache_root = directory.path().join("cache");
+        let receipt_root = directory.path().join("receipts");
+        let source_path = source_root.join("sessions/a.jsonl");
+        let bytes = concat!(
+            "{\"timestamp\":\"2026-08-01T01:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"session-a\",\"cwd\":\"/work/example\"}}\n",
+            "{\"timestamp\":\"2026-08-01T01:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Keep raw JSONL canonical.\"}}\n",
+            "{\"timestamp\":\"2026-08-01T01:01:30Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"custom_tool_call\",\"message\":\"must not send\"}}\n",
+            "{\"timestamp\":\"2026-08-01T01:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"I will use an adapter.\"}}\n"
+        )
+        .as_bytes();
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, bytes).unwrap();
+        let revision = CanonicalRevision::from_bytes(bytes);
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let subscription = catalog
+            .create_subscription(
+                SubscriptionConfig::new("hindsight", 1, true, false)
+                    .unwrap()
+                    .with_retry_policy(RetryPolicy::new(8, 0, 0).unwrap()),
+                SubscriptionMode::ReplayEvents,
+                0,
+            )
+            .unwrap();
+        catalog
+            .observe_present_at(
+                &identity(),
+                &LogicalLocation::new("active", "sessions/a.jsonl").unwrap(),
+                revision,
+                10,
+            )
+            .unwrap();
+        let roots = DeliveryRoots::new(vec![("active".to_owned(), source_root)]).unwrap();
+        let cache = MaterializationCache::new(
+            &cache_root,
+            MaterializationLimits::new(4096, 1, 4096).unwrap(),
+        )
+        .unwrap();
+        let runner = RecordingRunner::default();
+        let mut consumer = HindsightConsumer::new(&receipt_root, "codex-pilot", runner).unwrap();
+
+        let report = run_path_consumer(
+            &mut catalog,
+            subscription.id,
+            &roots,
+            &cache,
+            &mut consumer,
+            ControlledRunLimits::new(1, 4096, 100).unwrap(),
+            20,
+        )
+        .unwrap();
+
+        assert_eq!(report.attempts.len(), 1);
+        assert_eq!(consumer.runner.requests.len(), 1);
+        let request = &consumer.runner.requests[0];
+        assert!(
+            request
+                .content
+                .contains("User (2026-08-01T01:01:00Z): Keep raw JSONL canonical.")
+        );
+        assert!(
+            request
+                .content
+                .contains("Assistant (2026-08-01T01:02:00Z): I will use an adapter.")
+        );
+        assert!(!request.content.contains("must not send"));
+        assert_eq!(request.timestamp.as_deref(), Some("2026-08-01T01:02:00Z"));
+        assert_eq!(
+            request.metadata.get("session_id").map(String::as_str),
+            Some("session-a")
+        );
+        assert_eq!(request.tags, vec!["agent:codex", "workspace:example"]);
+        let subscription_root = fs::read_dir(&receipt_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let receipt = fs::read_to_string(
+            fs::read_dir(subscription_root)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
+        assert!(receipt.contains("\"consumer\":\"hindsight\""));
+        assert!(receipt.contains("\"operation_id\":\"operation-1\""));
+        assert!(receipt.contains(&revision.digest_hex()));
+    }
+}
