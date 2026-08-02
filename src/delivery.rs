@@ -388,12 +388,38 @@ impl Catalog {
             transaction.commit()?;
             return Ok(None);
         }
-        transaction.execute(
-            "UPDATE deliveries
-             SET state = 'queued', lease_token = NULL, lease_expires_at_ms = NULL
+        let mut expired_statement = transaction.prepare(
+            "SELECT id, attempts FROM deliveries
              WHERE subscription_id = ?1 AND state = 'leased' AND lease_expires_at_ms <= ?2",
-            params![subscription_id.as_uuid().as_bytes(), now_ms],
         )?;
+        let expired = expired_statement
+            .query_map(
+                params![subscription_id.as_uuid().as_bytes(), now_ms],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(expired_statement);
+        for (delivery_id, attempts) in expired {
+            let attempts = u32::try_from(attempts)
+                .map_err(|_| DeliveryError::Corrupt("invalid delivery attempts".to_owned()))?;
+            let not_before_ms = retry_not_before_ms(&admission.retry_policy, attempts, now_ms)?;
+            transaction.execute(
+                "UPDATE deliveries
+                 SET state = CASE WHEN attempts >= ?1 THEN 'dead_lettered' ELSE 'queued' END,
+                     lease_token = NULL, lease_expires_at_ms = NULL,
+                     not_before_ms = CASE WHEN attempts >= ?1 THEN not_before_ms ELSE ?2 END,
+                     settled_at_ms = CASE WHEN attempts >= ?1 THEN ?3 ELSE NULL END,
+                     settlement_reason = CASE WHEN attempts >= ?1
+                         THEN 'retry policy exhausted after lease expiry' ELSE NULL END
+                 WHERE id = ?4 AND state = 'leased' AND lease_expires_at_ms <= ?3",
+                params![
+                    i64::from(admission.retry_policy.max_attempts),
+                    not_before_ms,
+                    now_ms,
+                    delivery_id,
+                ],
+            )?;
+        }
         let active_leases: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM deliveries WHERE subscription_id = ?1 AND state = 'leased'",
             params![subscription_id.as_uuid().as_bytes()],
@@ -964,7 +990,11 @@ mod tests {
     fn later_record_versions_wait_for_the_prior_lease_to_settle() {
         let mut catalog = Catalog::open_in_memory().unwrap();
         let subscription = catalog
-            .create_subscription(config(), SubscriptionMode::ReplayEvents, 0)
+            .create_subscription(
+                config().with_retry_policy(RetryPolicy::new(8, 0, 0).unwrap()),
+                SubscriptionMode::ReplayEvents,
+                0,
+            )
             .unwrap();
         let identity = identity();
         catalog
@@ -1062,7 +1092,11 @@ mod tests {
     fn expired_lease_redelivers_with_the_same_event_id() {
         let mut catalog = Catalog::open_in_memory().unwrap();
         let subscription = catalog
-            .create_subscription(config(), SubscriptionMode::ReplayEvents, 0)
+            .create_subscription(
+                config().with_retry_policy(RetryPolicy::new(8, 0, 0).unwrap()),
+                SubscriptionMode::ReplayEvents,
+                0,
+            )
             .unwrap();
         let identity = identity();
         catalog
@@ -1092,7 +1126,11 @@ mod tests {
     fn an_expired_lease_cannot_acknowledge_or_retry_before_scheduler_cleanup() {
         let mut catalog = Catalog::open_in_memory().unwrap();
         let subscription = catalog
-            .create_subscription(config(), SubscriptionMode::ReplayEvents, 0)
+            .create_subscription(
+                config().with_retry_policy(RetryPolicy::new(8, 0, 0).unwrap()),
+                SubscriptionMode::ReplayEvents,
+                0,
+            )
             .unwrap();
         let identity = identity();
         catalog

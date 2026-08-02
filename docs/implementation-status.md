@@ -128,10 +128,10 @@ daemon, schedule, or real archive adapter.
 ## Implemented in progress: durable retry admission
 
 Subscriptions now persist a retry limit plus initial and capped maximum backoff.
-An explicit retry keeps its `(subscription_id, event_id)` identity, becomes
-leaseable only after the capped exponential delay, and transitions to a durable
-dead letter once the configured attempt limit is reached. Dead letters retain
-their existing per-record ordering-barrier behavior.
+An explicit retry or lease expiry keeps its `(subscription_id, event_id)`
+identity, becomes leaseable only after the capped exponential delay, and
+transitions to a durable dead letter once the configured attempt limit is
+reached. Dead letters retain their existing per-record ordering-barrier behavior.
 
 ## Implemented in progress: status and recovery-set proof
 
