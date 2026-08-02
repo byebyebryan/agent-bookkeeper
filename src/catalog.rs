@@ -14,7 +14,7 @@ use crate::domain::{
     RecordId, RecordIdentity, RecordState, RevisionId,
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Deployment-scoped provenance for one reconciled filesystem source.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +71,16 @@ pub struct SourceScan {
     generation: u64,
 }
 
+/// Durable, source-local position for the byte-budgeted integrity scrub. The
+/// position is a logical location, never an absolute source path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceScrubProgress {
+    pub source_id: String,
+    pub next_after: Option<LogicalLocation>,
+    pub completed_cycles: u64,
+    pub last_completed_at_ms: Option<i64>,
+}
+
 impl SourceScan {
     pub fn source_id(&self) -> &str {
         &self.source_id
@@ -89,6 +99,12 @@ pub struct SourceFingerprint {
     modified_nanoseconds: u32,
     device: Option<u64>,
     inode: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceObservation {
+    pub unchanged_observations: u32,
+    pub needs_hash: bool,
 }
 
 /// Metadata bound to the SQLite-aware backup artifact set. The caller supplies
@@ -138,6 +154,10 @@ impl SourceFingerprint {
             #[cfg(not(unix))]
             inode: None,
         })
+    }
+
+    pub fn byte_length(&self) -> u64 {
+        self.byte_length
     }
 }
 
@@ -264,6 +284,189 @@ impl Catalog {
             |row| row.get(0),
         )?;
         as_u64(sequence, "latest event sequence")
+    }
+
+    pub fn source_scrub_progress(
+        &self,
+        source_id: &str,
+    ) -> Result<SourceScrubProgress, CatalogError> {
+        let registered: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM source_state WHERE source_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if registered.is_none() {
+            return Err(CatalogError::SourceScanConflict(
+                "source is not registered".to_owned(),
+            ));
+        }
+        let row = self
+            .connection
+            .query_row(
+                "SELECT cursor_root_role, cursor_source_relative_path,
+                        completed_cycles, last_completed_at_ms
+                 FROM source_scrub_state WHERE source_id = ?1",
+                params![source_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((root_role, source_relative_path, completed_cycles, last_completed_at_ms)) = row
+        else {
+            return Ok(SourceScrubProgress {
+                source_id: source_id.to_owned(),
+                next_after: None,
+                completed_cycles: 0,
+                last_completed_at_ms: None,
+            });
+        };
+        let next_after = match (root_role, source_relative_path) {
+            (Some(root_role), Some(source_relative_path)) => {
+                Some(LogicalLocation::new(root_role, source_relative_path)?)
+            }
+            (None, None) => None,
+            _ => {
+                return Err(CatalogError::Corrupt(
+                    "incomplete source scrub cursor".to_owned(),
+                ));
+            }
+        };
+        Ok(SourceScrubProgress {
+            source_id: source_id.to_owned(),
+            next_after,
+            completed_cycles: as_u64(completed_cycles, "source scrub completed cycles")?,
+            last_completed_at_ms,
+        })
+    }
+
+    pub(crate) fn verify_source_registration(
+        &self,
+        registration: &SourceRegistration,
+    ) -> Result<(), CatalogError> {
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT producer_id, identity_schema_name, identity_schema_version
+                 FROM source_state WHERE source_id = ?1",
+                params![registration.source_id()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                CatalogError::SourceScanConflict("source is not registered".to_owned())
+            })?;
+        if existing.0 != registration.producer_id().as_uuid().as_bytes()
+            || existing.1 != registration.identity_schema_name()
+            || existing.2 != i64::from(registration.identity_schema_version())
+        {
+            return Err(CatalogError::SourceRegistrationConflict(
+                registration.source_id().to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Commits scrub progress only after one candidate has been fully observed
+    /// or intentionally deferred for the next full cycle. A complete cycle
+    /// clears the cursor and increments the durable cycle count.
+    pub(crate) fn advance_source_scrub(
+        &mut self,
+        source_id: &str,
+        next_after: Option<&LogicalLocation>,
+        cycle_completed: bool,
+        completed_at_ms: i64,
+    ) -> Result<(), CatalogError> {
+        if cycle_completed != next_after.is_none() {
+            return Err(CatalogError::Corrupt(
+                "source scrub completion must clear its cursor".to_owned(),
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let registered: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM source_state WHERE source_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if registered.is_none() {
+            return Err(CatalogError::SourceScanConflict(
+                "source is not registered".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO source_scrub_state (
+                source_id, cursor_root_role, cursor_source_relative_path,
+                completed_cycles, last_completed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(source_id) DO UPDATE SET
+                cursor_root_role = excluded.cursor_root_role,
+                cursor_source_relative_path = excluded.cursor_source_relative_path,
+                completed_cycles = source_scrub_state.completed_cycles + ?4,
+                last_completed_at_ms = CASE WHEN ?4 = 1
+                    THEN excluded.last_completed_at_ms
+                    ELSE source_scrub_state.last_completed_at_ms END",
+            params![
+                source_id,
+                next_after.map(LogicalLocation::root_role),
+                next_after.map(LogicalLocation::source_relative_path),
+                i64::from(cycle_completed),
+                if cycle_completed {
+                    Some(completed_at_ms)
+                } else {
+                    None
+                },
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Updates a record only when the scrub can prove it belongs to the named
+    /// source. A scrub never discovers new identities or changes source scan
+    /// presence; normal reconciliation remains responsible for those actions.
+    pub(crate) fn observe_scrubbed_present_at(
+        &mut self,
+        source_id: &str,
+        identity: &RecordIdentity,
+        location: &LogicalLocation,
+        revision: CanonicalRevision,
+        committed_at_ms: i64,
+    ) -> Result<Option<Vec<ArchiveEvent>>, CatalogError> {
+        let record = find_record(&self.connection, identity)?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let owned: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM source_records WHERE source_id = ?1 AND record_id = ?2",
+                params![source_id, record.id.as_uuid().as_bytes()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if owned.is_none() {
+            return Ok(None);
+        }
+        self.observe_present_at(identity, location, revision, committed_at_ms)
+            .map(Some)
     }
 
     /// Creates a consistent SQLite backup and an adjacent manifest. The target
@@ -454,14 +657,15 @@ impl Catalog {
         })
     }
 
-    /// Persists one cheap fingerprint and returns its consecutive unchanged
-    /// observation count. No full-file hash is implied by this operation.
+    /// Persists one cheap fingerprint and says whether this stable fingerprint
+    /// still requires a full hash. An admitted hash is marked separately only
+    /// after source/root verification allows its catalog commit.
     pub fn observe_source_fingerprint(
         &mut self,
         scan: &SourceScan,
         location: &LogicalLocation,
         fingerprint: &SourceFingerprint,
-    ) -> Result<u32, CatalogError> {
+    ) -> Result<SourceObservation, CatalogError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -469,7 +673,7 @@ impl Catalog {
         let existing = transaction
             .query_row(
                 "SELECT byte_length, modified_seconds, modified_nanoseconds, device, inode,
-                        unchanged_observations
+                        unchanged_observations, hash_admitted
                  FROM source_observations
                  WHERE source_id = ?1 AND root_role = ?2 AND source_relative_path = ?3",
                 params![
@@ -485,34 +689,38 @@ impl Catalog {
                         row.get::<_, Option<i64>>(3)?,
                         row.get::<_, Option<i64>>(4)?,
                         row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 },
             )
             .optional()?;
-        let unchanged_observations = if let Some(existing) = existing {
+        let (unchanged_observations, hash_admitted) = if let Some(existing) = existing {
             let matches = existing.0 == as_i64(fingerprint.byte_length, "source byte length")?
                 && existing.1 == fingerprint.modified_seconds
                 && existing.2 == i64::from(fingerprint.modified_nanoseconds)
                 && existing.3 == optional_as_i64(fingerprint.device, "source device")?
                 && existing.4 == optional_as_i64(fingerprint.inode, "source inode")?;
             if matches {
-                as_u64(existing.5, "unchanged observations")?
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        CatalogError::Corrupt("unchanged observation overflow".to_owned())
-                    })?
+                (
+                    as_u64(existing.5, "unchanged observations")?
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            CatalogError::Corrupt("unchanged observation overflow".to_owned())
+                        })?,
+                    existing.6 != 0,
+                )
             } else {
-                1
+                (1, false)
             }
         } else {
-            1
+            (1, false)
         };
         transaction.execute(
             "INSERT INTO source_observations (
                 source_id, root_role, source_relative_path, byte_length,
                 modified_seconds, modified_nanoseconds, device, inode,
-                unchanged_observations, last_seen_generation
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                unchanged_observations, hash_admitted, last_seen_generation
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(source_id, root_role, source_relative_path) DO UPDATE SET
                  byte_length = excluded.byte_length,
                  modified_seconds = excluded.modified_seconds,
@@ -520,6 +728,8 @@ impl Catalog {
                  device = excluded.device,
                  inode = excluded.inode,
                  unchanged_observations = excluded.unchanged_observations,
+                 hash_admitted = CASE WHEN excluded.unchanged_observations = 1
+                     THEN 0 ELSE source_observations.hash_admitted END,
                  last_seen_generation = excluded.last_seen_generation",
             params![
                 scan.source_id(),
@@ -531,12 +741,47 @@ impl Catalog {
                 optional_as_i64(fingerprint.device, "source device")?,
                 optional_as_i64(fingerprint.inode, "source inode")?,
                 as_i64(unchanged_observations, "unchanged observations")?,
+                i64::from(hash_admitted),
                 as_i64(scan.generation(), "source scan generation")?,
             ],
         )?;
         transaction.commit()?;
-        u32::try_from(unchanged_observations)
-            .map_err(|_| CatalogError::Corrupt("unchanged observations exceed u32".to_owned()))
+        Ok(SourceObservation {
+            unchanged_observations: u32::try_from(unchanged_observations).map_err(|_| {
+                CatalogError::Corrupt("unchanged observations exceed u32".to_owned())
+            })?,
+            needs_hash: !hash_admitted,
+        })
+    }
+
+    pub(crate) fn mark_source_fingerprint_hashed(
+        &mut self,
+        scan: &SourceScan,
+        location: &LogicalLocation,
+    ) -> Result<(), CatalogError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_current_source_scan(&transaction, scan)?;
+        let changed = transaction.execute(
+            "UPDATE source_observations
+             SET hash_admitted = 1
+             WHERE source_id = ?1 AND root_role = ?2 AND source_relative_path = ?3
+               AND last_seen_generation = ?4",
+            params![
+                scan.source_id(),
+                location.root_role(),
+                location.source_relative_path(),
+                as_i64(scan.generation(), "source scan generation")?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(CatalogError::SourceScanConflict(
+                "source fingerprint disappeared before hash admission".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Marks an already cataloged record as present in this scan. Calling it for
@@ -1418,6 +1663,35 @@ fn migrate(connection: &mut Connection) -> Result<(), CatalogError> {
             params![5, now_ms()?],
         )?;
     }
+    if found < 6 {
+        transaction.execute_batch(
+            "CREATE TABLE source_scrub_state (
+                 source_id TEXT PRIMARY KEY NOT NULL REFERENCES source_state(source_id),
+                 cursor_root_role TEXT NULL,
+                 cursor_source_relative_path TEXT NULL,
+                 completed_cycles INTEGER NOT NULL CHECK(completed_cycles >= 0),
+                 last_completed_at_ms INTEGER NULL,
+                 CHECK(
+                     (cursor_root_role IS NULL AND cursor_source_relative_path IS NULL)
+                     OR (cursor_root_role IS NOT NULL AND cursor_source_relative_path IS NOT NULL)
+                 )
+             );",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",
+            params![6, now_ms()?],
+        )?;
+    }
+    if found < 7 {
+        transaction.execute_batch(
+            "ALTER TABLE source_observations
+             ADD COLUMN hash_admitted INTEGER NOT NULL DEFAULT 0 CHECK(hash_admitted IN (0, 1));",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",
+            params![7, now_ms()?],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -1692,7 +1966,7 @@ mod tests {
     #[test]
     fn schema_and_unchanged_observation_are_stable() {
         let mut catalog = Catalog::open_in_memory().unwrap();
-        assert_eq!(catalog.schema_version().unwrap(), 5);
+        assert_eq!(catalog.schema_version().unwrap(), 7);
         let identity = identity();
         let revision = CanonicalRevision::from_bytes(b"first\n");
 

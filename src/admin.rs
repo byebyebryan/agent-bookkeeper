@@ -27,6 +27,8 @@ pub struct SourceStatus {
     pub tracked_records: u64,
     pub fingerprint_observations: u64,
     pub tombstone_candidates: u64,
+    pub scrub_completed_cycles: u64,
+    pub scrub_last_completed_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,8 +63,10 @@ pub fn catalog_status(catalog: &Catalog, now_ms: i64) -> Result<CatalogStatus, A
         "SELECT s.source_id, s.next_generation, s.last_complete_generation,
                 (SELECT COUNT(*) FROM source_records AS r WHERE r.source_id = s.source_id),
                 (SELECT COUNT(*) FROM source_observations AS o WHERE o.source_id = s.source_id),
-                (SELECT COUNT(*) FROM tombstone_candidates AS t WHERE t.source_id = s.source_id)
+                (SELECT COUNT(*) FROM tombstone_candidates AS t WHERE t.source_id = s.source_id),
+                COALESCE(sc.completed_cycles, 0), sc.last_completed_at_ms
          FROM source_state AS s
+         LEFT JOIN source_scrub_state AS sc ON sc.source_id = s.source_id
          ORDER BY s.source_id ASC",
     )?;
     let sources = source_statement
@@ -82,6 +86,9 @@ pub fn catalog_status(catalog: &Catalog, now_ms: i64) -> Result<CatalogStatus, A
                     .map_err(to_sql_error)?,
                 tombstone_candidates: as_u64(row.get::<_, i64>(5)?, "source tombstone candidates")
                     .map_err(to_sql_error)?,
+                scrub_completed_cycles: as_u64(row.get::<_, i64>(6)?, "scrub completed cycles")
+                    .map_err(to_sql_error)?,
+                scrub_last_completed_at_ms: row.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -222,6 +229,7 @@ mod tests {
         assert_eq!(status.active_records, 1);
         assert_eq!(status.sources.len(), 1);
         assert_eq!(status.sources[0].next_generation, scan.generation());
+        assert_eq!(status.sources[0].scrub_completed_cycles, 0);
         assert_eq!(status.subscriptions.len(), 1);
         assert!(!status.subscriptions[0].enabled);
         assert_eq!(status.subscriptions[0].deliveries.queued, 1);

@@ -30,6 +30,8 @@ The read-only source foundation provides:
 - provider-level filename filtering and a versioned Codex rollout schema;
 - cross-checking of the rollout filename UUID with `session_meta.payload.id`;
 - two unchanged observations before a candidate is hashed;
+- one admitted hash per stable fingerprint rather than rehashing every later
+  unchanged scan; a changed fingerprint becomes hash-pending again;
 - pre/post descriptor fingerprints, full streaming BLAKE3 hashing, duplicate
   identity rejection before commit, and change-during-hash rejection.
 - durable source registration, scan generations, and fingerprint observations;
@@ -38,10 +40,27 @@ The read-only source foundation provides:
   both scan boundaries plus complete-scan and elapsed-time grace;
 - stale-scan rejection, so a superseded scan cannot later overwrite presence
   state or emit a delayed tombstone.
+- an optional per-scan full-hash byte budget, with deferred stable candidates
+  remaining hash-pending for a later scan instead of being forgotten.
 
 Codex's local rollout layout is treated as a locally observed, versioned source
 schema—not a public Codex storage protocol. An unexpected layout or metadata
 mismatch is rejected rather than guessed.
+
+## Implemented in progress: resumable integrity scrub
+
+Each registered source now has a durable logical-location cursor, completed
+cycle counter, and last-completion time. An explicit scrub re-enumerates
+provider-approved current candidates and rehashes them under a byte budget. A
+single oversized first record is admitted so a large session cannot starve
+forever; later candidates resume next time from the persisted cursor.
+
+The scrub opens the same guarded descriptor pattern as reconciliation and only
+updates a record already owned by that source. It does not discover new records,
+infer missing records, or turn a partial scrub into deletion evidence. A scrub
+rewrite therefore follows the normal revision/event path, while a changing file
+is skipped until a later cycle. Fixtures cover same-size drift and a zero-budget
+resume boundary.
 
 ## Implemented in progress: verified external payload reader
 
@@ -116,9 +135,8 @@ revision, and event state.
 2. Finish payload and delivery: consumer policy (retry/backoff, filters, and
    explicit unavailable-revision policy), cross-process-safe cache reclamation,
    and a real adapter boundary.
-3. Operational proof: resumable integrity scrub, source resource controls,
-   representative large-record measurements, cache crash reclamation, and a
-   controlled evidence-consumer cohort.
+3. Operational proof: representative large-record measurements, cache crash
+   reclamation, retry/backoff policy, and a controlled evidence-consumer cohort.
 
 ## Validation
 

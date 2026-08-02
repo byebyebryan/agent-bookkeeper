@@ -16,7 +16,7 @@ pub mod source_fs;
 pub use admin::{AdminError, CatalogStatus, SourceStatus, SubscriptionStatus, catalog_status};
 pub use catalog::{
     BackupArtifact, BackupMetadata, Catalog, CatalogError, CurrentRecord, SourceFingerprint,
-    SourceRegistration, SourceScan, TombstoneGrace,
+    SourceObservation, SourceRegistration, SourceScan, SourceScrubProgress, TombstoneGrace,
 };
 pub use controller::{
     ControlledDeliveryAttempt, ControlledDeliveryOutcome, ControlledRunLimits, ControlledRunReport,
@@ -36,5 +36,6 @@ pub use payload::{
 };
 pub use source_fs::{
     Blake3RevisionHasher, CodexRolloutLayout, DeletionMode, IdentitySchema, LayoutPlugin,
-    ReconcileReport, Reconciler, RootGuard, SourceConfig, SourceError, SourceRoot, StabilityPolicy,
+    ReconcileReport, Reconciler, RootGuard, ScrubReport, SourceConfig, SourceError, SourceRoot,
+    StabilityPolicy,
 };

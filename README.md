@@ -19,9 +19,11 @@ grace, held-descriptor validation for borrowed source bytes, and a durable
 subscription/lease ledger that preserves per-record version ordering. A bounded
 path-consumer proof harness creates verified lease-scoped copies instead of
 exposing mutable source paths, and demonstrates idempotent redelivery with a
-fake adapter. Integrity scrub, cache operational closure, and real consumers
-remain pending. The current library also exposes content-free catalog status and
+fake adapter. The current library also exposes content-free catalog status and
 SQLite-aware backup/validation/restore helpers for the durable control ledger.
+It includes an explicit byte-budgeted integrity scrub with a durable cursor, so
+steady scans can stay metadata-only while unchanged records are still rehashed
+over time. Cache operational closure and real consumers remain pending.
 See [implementation status](docs/implementation-status.md).
 
 V2's protocol is detailed but intentionally not frozen until the shared V1.5

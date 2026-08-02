@@ -9,13 +9,15 @@ use std::ffi::{CString, OsStr};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::catalog::{
-    Catalog, CatalogError, SourceFingerprint, SourceRegistration, TombstoneGrace,
+    Catalog, CatalogError, SourceFingerprint, SourceRegistration, SourceScrubProgress,
+    TombstoneGrace,
 };
 use crate::domain::{
     ArchiveEvent, CanonicalRevision, DomainError, LogicalLocation, ProducerId, RecordIdentity,
@@ -241,6 +243,7 @@ pub struct SourceConfig {
     roots: Vec<SourceRoot>,
     deletion_mode: DeletionMode,
     stability_policy: StabilityPolicy,
+    hash_byte_budget_per_scan: u64,
 }
 
 impl SourceConfig {
@@ -285,6 +288,7 @@ impl SourceConfig {
             roots,
             deletion_mode,
             stability_policy,
+            hash_byte_budget_per_scan: u64::MAX,
         })
     }
 
@@ -294,6 +298,18 @@ impl SourceConfig {
 
     pub fn deletion_mode(&self) -> DeletionMode {
         self.deletion_mode
+    }
+
+    /// Caps admitted full-file hashing per ordinary reconciliation sweep.
+    /// As with the scrub budget, one first oversized candidate is allowed so
+    /// a large record cannot starve indefinitely.
+    pub fn with_hash_byte_budget_per_scan(mut self, byte_budget: u64) -> Self {
+        self.hash_byte_budget_per_scan = byte_budget;
+        self
+    }
+
+    pub fn hash_byte_budget_per_scan(&self) -> u64 {
+        self.hash_byte_budget_per_scan
     }
 
     fn registration(
@@ -408,7 +424,7 @@ where
 
         let mut accepted = Vec::new();
         for candidate in parsed_candidates {
-            let unchanged_observations = catalog
+            let observation = catalog
                 .observe_source_fingerprint(
                     &scan,
                     candidate.parsed.location(),
@@ -418,8 +434,23 @@ where
             catalog
                 .mark_source_record_seen(&scan, &registration, candidate.parsed.identity())
                 .map_err(SourceError::Catalog)?;
-            if unchanged_observations < self.config.stability_policy.min_unchanged_observations() {
+            let required_observations = self.config.stability_policy.min_unchanged_observations();
+            if observation.unchanged_observations < required_observations {
                 report.awaiting_stability += 1;
+                continue;
+            }
+            if !observation.needs_hash {
+                report.already_stable += 1;
+                continue;
+            }
+            let candidate_bytes = candidate.candidate.fingerprint.byte_length();
+            if report.bytes_hashed > 0
+                && report
+                    .bytes_hashed
+                    .checked_add(candidate_bytes)
+                    .is_none_or(|bytes| bytes > self.config.hash_byte_budget_per_scan)
+            {
+                report.deferred_by_hash_budget += 1;
                 continue;
             }
             let root = &self.config.roots[candidate.candidate.root_index];
@@ -470,6 +501,9 @@ where
                     revision,
                 )
                 .map_err(SourceError::Catalog)?;
+            catalog
+                .mark_source_fingerprint_hashed(&scan, parsed.location())
+                .map_err(SourceError::Catalog)?;
             report.events.extend(events);
         }
         let tombstone_grace = match self.config.deletion_mode {
@@ -480,6 +514,153 @@ where
             .complete_source_scan_now(&scan, tombstone_grace)
             .map_err(SourceError::Catalog)?;
         report.events.extend(tombstone_events);
+        Ok(report)
+    }
+
+    /// Rehashes otherwise stable candidates under a durable cursor and a
+    /// byte budget. This is an integrity check, not a second reconciliation
+    /// pass: it neither discovers new records nor infers missing records.
+    ///
+    /// A single candidate larger than `byte_budget` is still admitted when no
+    /// bytes have been hashed in this invocation, so a large transcript cannot
+    /// permanently starve the scrub cursor.
+    pub fn scrub(
+        &mut self,
+        catalog: &mut Catalog,
+        byte_budget: u64,
+    ) -> Result<ScrubReport, SourceError> {
+        self.verify_roots()?;
+        let registration = self.config.registration(&self.layout.identity_schema())?;
+        catalog
+            .verify_source_registration(&registration)
+            .map_err(SourceError::Catalog)?;
+        let progress = catalog
+            .source_scrub_progress(self.config.source_id())
+            .map_err(SourceError::Catalog)?;
+        let mut candidates = self
+            .enumerate_candidates()?
+            .into_iter()
+            .filter(|candidate| self.layout.is_candidate_path(&candidate.relative_path))
+            .map(|candidate| {
+                let root = &self.config.roots[candidate.root_index];
+                let location = LogicalLocation::new(
+                    root.root_role(),
+                    normalized_relative_path(&candidate.relative_path)?,
+                )?;
+                Ok(ScrubCandidate {
+                    candidate,
+                    location,
+                })
+            })
+            .collect::<Result<Vec<_>, SourceError>>()?;
+        candidates.sort_by(|left, right| location_order(&left.location, &right.location));
+
+        let mut report = ScrubReport {
+            start: progress.clone(),
+            ..ScrubReport::default()
+        };
+        let mut exhausted_budget = false;
+        for candidate in candidates {
+            if progress
+                .next_after
+                .as_ref()
+                .is_some_and(|cursor| location_order(&candidate.location, cursor).is_le())
+            {
+                continue;
+            }
+            let candidate_bytes = candidate.candidate.fingerprint.byte_length();
+            if report.bytes_hashed > 0
+                && report
+                    .bytes_hashed
+                    .checked_add(candidate_bytes)
+                    .is_none_or(|bytes| bytes > byte_budget)
+            {
+                exhausted_budget = true;
+                break;
+            }
+            report.candidates_considered = report
+                .candidates_considered
+                .checked_add(1)
+                .ok_or(SourceError::CounterOverflow)?;
+            let root = &self.config.roots[candidate.candidate.root_index];
+            let mut file = open_file_beneath(&root.path, &candidate.candidate.relative_path)?;
+            let before =
+                SourceFingerprint::from_metadata(&file.metadata().map_err(SourceError::Read)?)
+                    .map_err(SourceError::Read)?;
+            if before != candidate.candidate.fingerprint {
+                report.changed_during_scrub = report
+                    .changed_during_scrub
+                    .checked_add(1)
+                    .ok_or(SourceError::CounterOverflow)?;
+                advance_scrub_cursor(catalog, self.config.source_id(), &candidate.location)?;
+                continue;
+            }
+            let parsed = self.layout.parse_record(
+                self.config.producer_id,
+                root.root_role(),
+                &candidate.candidate.relative_path,
+                &mut file,
+            )?;
+            let Some(parsed) = parsed else {
+                advance_scrub_cursor(catalog, self.config.source_id(), &candidate.location)?;
+                continue;
+            };
+            if parsed.location() != &candidate.location {
+                return Err(SourceError::InvalidProviderRecord {
+                    relative_path: candidate.candidate.relative_path,
+                    reason: "provider location changed while scrubbed".to_owned(),
+                });
+            }
+            let revision = self.hasher.hash(&mut file)?;
+            let after =
+                SourceFingerprint::from_metadata(&file.metadata().map_err(SourceError::Read)?)
+                    .map_err(SourceError::Read)?;
+            if before != after {
+                report.changed_during_scrub = report
+                    .changed_during_scrub
+                    .checked_add(1)
+                    .ok_or(SourceError::CounterOverflow)?;
+                advance_scrub_cursor(catalog, self.config.source_id(), &candidate.location)?;
+                continue;
+            }
+            report.files_hashed = report
+                .files_hashed
+                .checked_add(1)
+                .ok_or(SourceError::CounterOverflow)?;
+            report.bytes_hashed = report
+                .bytes_hashed
+                .checked_add(revision.byte_length())
+                .ok_or(SourceError::CounterOverflow)?;
+            if let Some(events) = catalog
+                .observe_scrubbed_present_at(
+                    self.config.source_id(),
+                    parsed.identity(),
+                    parsed.location(),
+                    revision,
+                    current_time_ms()?,
+                )
+                .map_err(SourceError::Catalog)?
+            {
+                report.events.extend(events);
+            } else {
+                report.untracked_candidates = report
+                    .untracked_candidates
+                    .checked_add(1)
+                    .ok_or(SourceError::CounterOverflow)?;
+            }
+            advance_scrub_cursor(catalog, self.config.source_id(), &candidate.location)?;
+        }
+
+        self.verify_roots()?;
+        if !exhausted_budget {
+            catalog
+                .advance_source_scrub(self.config.source_id(), None, true, current_time_ms()?)
+                .map_err(SourceError::Catalog)?;
+            report.completed_cycle = true;
+        }
+        report.end = catalog
+            .source_scrub_progress(self.config.source_id())
+            .map_err(SourceError::Catalog)?;
         Ok(report)
     }
 
@@ -518,9 +699,50 @@ where
 pub struct ReconcileReport {
     pub files_enumerated: u64,
     pub awaiting_stability: u64,
+    pub already_stable: u64,
+    pub deferred_by_hash_budget: u64,
     pub changed_during_scan: u64,
     pub bytes_hashed: u64,
     pub events: Vec<ArchiveEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScrubReport {
+    pub start: SourceScrubProgress,
+    pub end: SourceScrubProgress,
+    pub candidates_considered: u64,
+    pub files_hashed: u64,
+    pub bytes_hashed: u64,
+    pub changed_during_scrub: u64,
+    pub untracked_candidates: u64,
+    pub completed_cycle: bool,
+    pub events: Vec<ArchiveEvent>,
+}
+
+impl Default for ScrubReport {
+    fn default() -> Self {
+        Self {
+            start: SourceScrubProgress {
+                source_id: String::new(),
+                next_after: None,
+                completed_cycles: 0,
+                last_completed_at_ms: None,
+            },
+            end: SourceScrubProgress {
+                source_id: String::new(),
+                next_after: None,
+                completed_cycles: 0,
+                last_completed_at_ms: None,
+            },
+            candidates_considered: 0,
+            files_hashed: 0,
+            bytes_hashed: 0,
+            changed_during_scrub: 0,
+            untracked_candidates: 0,
+            completed_cycle: false,
+            events: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -534,6 +756,36 @@ struct FileCandidate {
 struct StableCandidate {
     candidate: FileCandidate,
     parsed: ParsedRecord,
+}
+
+#[derive(Clone, Debug)]
+struct ScrubCandidate {
+    candidate: FileCandidate,
+    location: LogicalLocation,
+}
+
+fn location_order(left: &LogicalLocation, right: &LogicalLocation) -> std::cmp::Ordering {
+    left.root_role().cmp(right.root_role()).then_with(|| {
+        left.source_relative_path()
+            .cmp(right.source_relative_path())
+    })
+}
+
+fn advance_scrub_cursor(
+    catalog: &mut Catalog,
+    source_id: &str,
+    location: &LogicalLocation,
+) -> Result<(), SourceError> {
+    catalog
+        .advance_source_scrub(source_id, Some(location), false, current_time_ms()?)
+        .map_err(SourceError::Catalog)
+}
+
+fn current_time_ms() -> Result<i64, SourceError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| SourceError::ClockBeforeEpoch)?;
+    i64::try_from(duration.as_millis()).map_err(|_| SourceError::CounterOverflow)
 }
 
 fn enumerate_root(
@@ -791,6 +1043,8 @@ pub enum SourceError {
     },
     #[error("source counters overflowed")]
     CounterOverflow,
+    #[error("system clock is before the Unix epoch")]
+    ClockBeforeEpoch,
     #[error("guarded filesystem access requires Unix openat support")]
     UnsupportedPlatform,
 }
@@ -864,6 +1118,7 @@ mod tests {
             .unwrap();
         let changed = reconciler.scan(&mut catalog).unwrap();
         let stable_rewrite = reconciler.scan(&mut catalog).unwrap();
+        let steady = reconciler.scan(&mut catalog).unwrap();
 
         assert_eq!(first.events.len(), 0);
         assert_eq!(first.awaiting_stability, 1);
@@ -872,6 +1127,8 @@ mod tests {
         assert_eq!(changed.events.len(), 0);
         assert_eq!(stable_rewrite.events.len(), 1);
         assert_eq!(stable_rewrite.events[0].kind, EventKind::RevisionCommitted);
+        assert_eq!(steady.bytes_hashed, 0);
+        assert_eq!(steady.already_stable, 1);
         assert_eq!(catalog.events_after(0).unwrap().len(), 2);
     }
 
@@ -1145,5 +1402,81 @@ mod tests {
             Err(SourceError::UnhealthyRoot { .. })
         ));
         assert!(catalog.events_after(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scrub_rehashes_a_known_record_and_commits_same_size_drift() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let path = session_file(root, Uuid::new_v4(), "first\n");
+        let mut reconciler = Reconciler::new(
+            guarded_config(root, DeletionMode::Disabled),
+            CodexRolloutLayout,
+        );
+        let mut catalog = Catalog::open_in_memory().unwrap();
+
+        reconciler.scan(&mut catalog).unwrap();
+        reconciler.scan(&mut catalog).unwrap();
+        let original = fs::read(&path).unwrap();
+        let rewritten = String::from_utf8(original)
+            .unwrap()
+            .replace("first\n", "other\n");
+        fs::write(&path, rewritten).unwrap();
+
+        let scrub = reconciler.scrub(&mut catalog, 0).unwrap();
+
+        assert_eq!(scrub.files_hashed, 1);
+        assert_eq!(scrub.events.len(), 1);
+        assert_eq!(scrub.events[0].kind, EventKind::RevisionCommitted);
+        assert!(scrub.completed_cycle);
+        assert_eq!(scrub.end.completed_cycles, 1);
+        assert_eq!(catalog.events_after(0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn scrub_cursor_resumes_after_a_byte_budget_and_then_completes() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        session_file(root, Uuid::new_v4(), "first\n");
+        session_file(root, Uuid::new_v4(), "second\n");
+        let mut reconciler = Reconciler::new(
+            guarded_config(root, DeletionMode::Disabled),
+            CodexRolloutLayout,
+        );
+        let mut catalog = Catalog::open_in_memory().unwrap();
+
+        reconciler.scan(&mut catalog).unwrap();
+        reconciler.scan(&mut catalog).unwrap();
+        let first = reconciler.scrub(&mut catalog, 0).unwrap();
+        let second = reconciler.scrub(&mut catalog, 0).unwrap();
+
+        assert_eq!(first.files_hashed, 1);
+        assert!(!first.completed_cycle);
+        assert!(first.end.next_after.is_some());
+        assert_eq!(second.files_hashed, 1);
+        assert!(second.completed_cycle);
+        assert_eq!(second.end.completed_cycles, 1);
+        assert!(second.end.next_after.is_none());
+    }
+
+    #[test]
+    fn ordinary_scan_hash_budget_defers_then_later_admits_a_stable_candidate() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        session_file(root, Uuid::new_v4(), "first\n");
+        session_file(root, Uuid::new_v4(), "second\n");
+        let config = guarded_config(root, DeletionMode::Disabled).with_hash_byte_budget_per_scan(0);
+        let mut reconciler = Reconciler::new(config, CodexRolloutLayout);
+        let mut catalog = Catalog::open_in_memory().unwrap();
+
+        reconciler.scan(&mut catalog).unwrap();
+        let constrained = reconciler.scan(&mut catalog).unwrap();
+        let resumed = reconciler.scan(&mut catalog).unwrap();
+
+        assert_eq!(constrained.events.len(), 1);
+        assert_eq!(constrained.deferred_by_hash_budget, 1);
+        assert_eq!(resumed.events.len(), 1);
+        assert_eq!(resumed.already_stable, 1);
+        assert_eq!(catalog.events_after(0).unwrap().len(), 2);
     }
 }

@@ -111,6 +111,14 @@ so restored timestamps or same-size changes cannot remain invisible forever.
 Scrub mismatch opens an integrity alert and normal revision reconciliation; it
 does not silently rewrite history.
 
+The V1.5 reference library implements the cursor as source-scoped logical root
+role plus relative path, along with a completed-cycle counter and completion
+time in the catalog. A scrub only revisits records already owned by the source;
+new records and deletion/move reconciliation stay with the ordinary guarded
+scan. The first candidate may exceed a run's byte budget so one large record
+cannot starve permanently. Representative source measurements and operational
+scheduling remain deployment proof work.
+
 V2 clients follow the same correctness baseline: a changed record is streamed
 completely to calculate its canonical digest and fixed chunk manifest. The first
 protocol does not use an append fast path. A future provider-specific fast path
