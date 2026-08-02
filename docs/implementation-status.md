@@ -74,6 +74,15 @@ The helper deliberately does not publish a benchmark headline. A deployment
 still needs to record its own representative seed, append/rewrite, scrub, and
 consumer-cohort envelopes under the selected limits and hardware.
 
+## Implemented in progress: concrete evidence-adapter boundary
+
+`FilesystemEvidenceConsumer` is a reusable controlled-cohort adapter that
+reads a verified lease-scoped payload, verifies its canonical revision again,
+and atomically writes only a provenance manifest keyed by subscription and
+event. Reapplying the same event validates the existing manifest rather than
+creating a duplicate derived effect. It is a local proof adapter, not a
+replacement for a search or learned-memory consumer.
+
 ## Implemented in progress: verified external payload reader
 
 `CurrentExternalRevision` resolves a configured root-relative file through a
