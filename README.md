@@ -39,9 +39,11 @@ adapter through its HTTP API. Its stable legacy renderer is retained for an
 existing pilot, while opt-in reference profiles follow Hindsight's maintained
 Codex semantics: use final user/assistant response items, discard synthetic
 `AGENTS.md` setup text and injected-memory echoes, and optionally preserve
-bounded structured tool context. A receipt and request metadata record the
-chosen renderer profile, so trial evidence cannot be confused with older
-output. An optional `--observation-scopes` setting records the explicit
+bounded structured tool context. The readable `reference-message-v3` profile
+also uses a viewer-safe document key while retaining canonical source URI
+provenance. A receipt and request metadata record the chosen renderer profile,
+so trial evidence cannot be confused with older output. An optional
+`--observation-scopes` setting records the explicit
 Hindsight consolidation boundary (`per_tag`, `combined`, `all_combinations`, or
 `shared`) in each retain request and receipt; its default preserves the server
 default. An optional source-relative include manifest makes a cohort an exact

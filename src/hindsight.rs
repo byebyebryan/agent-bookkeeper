@@ -85,16 +85,19 @@ pub trait HindsightRunner {
 
 /// The Codex transcript rendering contract used before a Hindsight retain call.
 ///
-/// `LegacyV1` is retained for the existing pilot. The two reference profiles
+/// `LegacyV1` is retained for the existing pilot. The v2 reference profiles
 /// are isolated trial modes based on Hindsight's maintained Codex integration:
 /// they use `response_item` messages, drop synthetic AGENTS.md startup text and
 /// remove recalled-memory echoes. `ReferenceToolAware` additionally preserves
-/// bounded structured tool context.
+/// bounded structured tool context. `ReferenceMessageV3` preserves the same
+/// message selection but renders it as readable transcript text for Hindsight's
+/// document viewer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HindsightRenderProfile {
     LegacyV1,
     ReferenceMessage,
     ReferenceToolAware,
+    ReferenceMessageV3,
 }
 
 impl HindsightRenderProfile {
@@ -103,6 +106,7 @@ impl HindsightRenderProfile {
             Self::LegacyV1 => "legacy-v1",
             Self::ReferenceMessage => "reference-message-v2",
             Self::ReferenceToolAware => "reference-tool-aware-v2",
+            Self::ReferenceMessageV3 => "reference-message-v3",
         }
     }
 
@@ -111,10 +115,23 @@ impl HindsightRenderProfile {
             "legacy-v1" => Ok(Self::LegacyV1),
             "reference-message-v2" => Ok(Self::ReferenceMessage),
             "reference-tool-aware-v2" => Ok(Self::ReferenceToolAware),
+            "reference-message-v3" => Ok(Self::ReferenceMessageV3),
             _ => Err(HindsightConsumerError::InvalidConfiguration(format!(
-                "unknown Hindsight render profile {value:?}; expected legacy-v1, reference-message-v2, or reference-tool-aware-v2"
+                "unknown Hindsight render profile {value:?}; expected legacy-v1, reference-message-v2, reference-tool-aware-v2, or reference-message-v3"
             ))),
         }
+    }
+
+    const fn renderer_version(self) -> &'static str {
+        match self {
+            Self::LegacyV1 => "1",
+            Self::ReferenceMessage | Self::ReferenceToolAware => "2",
+            Self::ReferenceMessageV3 => "3",
+        }
+    }
+
+    const fn uses_url_safe_document_id(self) -> bool {
+        matches!(self, Self::ReferenceMessageV3)
     }
 }
 
@@ -311,6 +328,18 @@ impl<R> HindsightConsumer<R> {
     pub fn source_id(delivery: &DeliveryLease) -> String {
         format!("agent-bookkeeper://record/{}", delivery.record_id.as_uuid())
     }
+
+    /// Returns the Hindsight document key for a delivery. The human/provenance
+    /// source ID remains a URI in request metadata and receipts; the v3 viewer
+    /// renderer uses a URL-safe key because the Control Plane routes document
+    /// IDs through a single Next.js path segment.
+    pub fn document_id(delivery: &DeliveryLease, render_profile: HindsightRenderProfile) -> String {
+        if render_profile.uses_url_safe_document_id() {
+            format!("agent-bookkeeper-record-{}", delivery.record_id.as_uuid())
+        } else {
+            Self::source_id(delivery)
+        }
+    }
 }
 
 impl<R: HindsightRunner> HindsightConsumer<R> {
@@ -332,12 +361,14 @@ impl<R: HindsightRunner> HindsightConsumer<R> {
             (None, None) => None,
         };
         let source_id = Self::source_id(delivery);
+        let document_id = Self::document_id(delivery, self.render_profile);
         let destination = self.receipt_path(delivery);
         if destination.exists() {
             let expected = receipt_bytes(
                 delivery,
                 payload_revision,
                 &source_id,
+                &document_id,
                 &self.bank_id,
                 self.render_profile,
                 self.observation_scopes,
@@ -360,6 +391,7 @@ impl<R: HindsightRunner> HindsightConsumer<R> {
                 revision,
                 &self.bank_id,
                 source_id.clone(),
+                document_id.clone(),
                 self.render_profile,
                 self.observation_scopes,
                 transcript,
@@ -376,6 +408,7 @@ impl<R: HindsightRunner> HindsightConsumer<R> {
             delivery,
             payload_revision,
             &source_id,
+            &document_id,
             &self.bank_id,
             self.render_profile,
             self.observation_scopes,
@@ -517,7 +550,8 @@ fn parse_codex_transcript(
                             continue;
                         }
                         match profile {
-                            HindsightRenderProfile::ReferenceMessage => {
+                            HindsightRenderProfile::ReferenceMessage
+                            | HindsightRenderProfile::ReferenceMessageV3 => {
                                 messages.push(RenderedMessage {
                                     role,
                                     content: vec![json!({"type": "text", "text": text})],
@@ -619,11 +653,14 @@ fn parse_codex_transcript(
                     continue;
                 }
                 match profile {
-                    HindsightRenderProfile::ReferenceMessage => messages.push(RenderedMessage {
-                        role,
-                        content: vec![json!({"type": "text", "text": text})],
-                        timestamp: timestamp.clone(),
-                    }),
+                    HindsightRenderProfile::ReferenceMessage
+                    | HindsightRenderProfile::ReferenceMessageV3 => {
+                        messages.push(RenderedMessage {
+                            role,
+                            content: vec![json!({"type": "text", "text": text})],
+                            timestamp: timestamp.clone(),
+                        })
+                    }
                     HindsightRenderProfile::ReferenceToolAware if role == "user" => {
                         flush_assistant(
                             &mut messages,
@@ -684,19 +721,25 @@ fn parse_codex_transcript(
         .iter()
         .rev()
         .find_map(|message| message.timestamp.clone());
-    let content = serde_json::to_string(
-        &messages
-            .iter()
-            .map(|message| {
-                let mut value = json!({"role": message.role, "content": message.content});
-                if let Some(timestamp) = &message.timestamp {
-                    value["timestamp"] = Value::String(timestamp.clone());
-                }
-                value
-            })
-            .collect::<Vec<_>>(),
-    )
-    .expect("Codex render values serialize without error");
+    let content = match profile {
+        HindsightRenderProfile::ReferenceMessageV3 => render_readable_messages(&messages),
+        HindsightRenderProfile::ReferenceMessage | HindsightRenderProfile::ReferenceToolAware => {
+            serde_json::to_string(
+                &messages
+                    .iter()
+                    .map(|message| {
+                        let mut value = json!({"role": message.role, "content": message.content});
+                        if let Some(timestamp) = &message.timestamp {
+                            value["timestamp"] = Value::String(timestamp.clone());
+                        }
+                        value
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("Codex render values serialize without error")
+        }
+        HindsightRenderProfile::LegacyV1 => unreachable!(),
+    };
     Ok(CodexTranscript {
         content,
         session_id,
@@ -801,6 +844,58 @@ fn flush_assistant(
         content: std::mem::take(assistant_blocks),
         timestamp: assistant_timestamp.take(),
     });
+}
+
+fn render_readable_messages(messages: &[RenderedMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| {
+            let role = match message.role {
+                "user" => "User",
+                "assistant" => "Assistant",
+                _ => unreachable!("rendered messages have only user or assistant roles"),
+            };
+            let timestamp = message.timestamp.as_deref().unwrap_or("unknown time");
+            format!(
+                "{role} ({timestamp}):\n{}",
+                render_message_blocks(&message.content)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn render_message_blocks(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| {
+            let object = block.as_object()?;
+            match object.get("type").and_then(Value::as_str) {
+                Some("text") => object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                Some("tool_use") => {
+                    let name = object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let input = object.get("input").cloned().unwrap_or_else(|| json!({}));
+                    Some(format!(
+                        "Tool call ({name}): {}",
+                        serde_json::to_string(&input)
+                            .expect("tool call input values serialize without error")
+                    ))
+                }
+                Some("tool_result") => object
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(|content| format!("Tool result:\n{content}")),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn append_tool_response_item(
@@ -1043,7 +1138,7 @@ fn strip_memory_tags(value: &str) -> (String, bool) {
 
 fn is_synthetic_codex_user_message(value: &str) -> bool {
     let value = value.trim_start();
-    value.starts_with("# AGENTS.md instructions for ")
+    value.starts_with("# AGENTS.md instructions")
         && value.contains("<INSTRUCTIONS>")
         && value.contains("</INSTRUCTIONS>")
 }
@@ -1053,12 +1148,14 @@ fn retain_request(
     revision: CanonicalRevision,
     bank_id: &str,
     source_id: String,
+    document_id: String,
     render_profile: HindsightRenderProfile,
     observation_scopes: Option<HindsightObservationScopes>,
     transcript: CodexTranscript,
 ) -> Result<HindsightRetainRequest, HindsightConsumerError> {
     let mut metadata = BTreeMap::from([
         ("source_id".to_owned(), source_id.clone()),
+        ("hindsight_document_id".to_owned(), document_id.clone()),
         (
             "record_id".to_owned(),
             delivery.record_id.as_uuid().to_string(),
@@ -1084,7 +1181,10 @@ fn retain_request(
             "renderer_profile".to_owned(),
             render_profile.name().to_owned(),
         ),
-        ("renderer_version".to_owned(), "2".to_owned()),
+        (
+            "renderer_version".to_owned(),
+            render_profile.renderer_version().to_owned(),
+        ),
         (
             "render_source_messages".to_owned(),
             transcript.render_stats.source_messages.to_string(),
@@ -1142,7 +1242,9 @@ fn retain_request(
         .unwrap_or_else(|| "unknown".to_owned());
     let mut context = match render_profile {
         HindsightRenderProfile::LegacyV1 => "Codex agent-session transcript".to_owned(),
-        HindsightRenderProfile::ReferenceMessage | HindsightRenderProfile::ReferenceToolAware => {
+        HindsightRenderProfile::ReferenceMessage
+        | HindsightRenderProfile::ReferenceToolAware
+        | HindsightRenderProfile::ReferenceMessageV3 => {
             "Conversation between a human collaborator (User) and the Codex coding agent (Assistant).".to_owned()
         }
     };
@@ -1150,13 +1252,14 @@ fn retain_request(
         match render_profile {
             HindsightRenderProfile::LegacyV1 => context.push_str(" from workspace "),
             HindsightRenderProfile::ReferenceMessage
-            | HindsightRenderProfile::ReferenceToolAware => context.push_str(" Workspace: "),
+            | HindsightRenderProfile::ReferenceToolAware
+            | HindsightRenderProfile::ReferenceMessageV3 => context.push_str(" Workspace: "),
         }
         context.push_str(session_cwd);
     }
     Ok(HindsightRetainRequest {
         bank_id: bank_id.to_owned(),
-        document_id: source_id.clone(),
+        document_id,
         source_id,
         content: transcript.content,
         context,
@@ -1239,6 +1342,7 @@ fn receipt_bytes(
     delivery: &DeliveryLease,
     payload: Option<CanonicalRevision>,
     source_id: &str,
+    document_id: &str,
     bank_id: &str,
     render_profile: HindsightRenderProfile,
     observation_scopes: Option<HindsightObservationScopes>,
@@ -1268,7 +1372,7 @@ fn receipt_bytes(
         "record_version": delivery.record_version,
         "event_kind": event_kind_name(delivery.kind),
         "source_id": source_id,
-        "document_id": source_id,
+        "document_id": document_id,
         "bank_id": bank_id,
         "renderer_profile": render_profile.name(),
         "operation_id": operation_id,
@@ -1380,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_renders_only_messages_and_writes_a_provenance_receipt() {
+    fn v3_adapter_renders_readable_messages_with_a_viewer_safe_document_id() {
         let directory = tempdir().unwrap();
         let source_root = directory.path().join("source");
         let cache_root = directory.path().join("cache");
@@ -1424,7 +1528,7 @@ mod tests {
         let mut consumer = HindsightConsumer::new_with_render_profile_and_observation_scopes(
             &receipt_root,
             "codex-pilot",
-            HindsightRenderProfile::LegacyV1,
+            HindsightRenderProfile::ReferenceMessageV3,
             Some(HindsightObservationScopes::Shared),
             runner,
         )
@@ -1447,14 +1551,25 @@ mod tests {
         assert!(
             request
                 .content
-                .contains("User (2026-08-01T01:01:00Z): Keep raw JSONL canonical.")
+                .contains("User (2026-08-01T01:01:00Z):\nKeep raw JSONL canonical.")
         );
         assert!(
             request
                 .content
-                .contains("Assistant (2026-08-01T01:02:00Z): I will use an adapter.")
+                .contains("Assistant (2026-08-01T01:02:00Z):\nI will use an adapter.")
         );
         assert!(!request.content.contains("must not send"));
+        assert_eq!(
+            request.document_id,
+            format!("agent-bookkeeper-record-{}", request.metadata["record_id"])
+        );
+        assert_eq!(
+            request.source_id,
+            format!(
+                "agent-bookkeeper://record/{}",
+                request.metadata["record_id"]
+            )
+        );
         assert_eq!(request.timestamp.as_deref(), Some("2026-08-01T01:02:00Z"));
         assert_eq!(
             request.metadata.get("session_id").map(String::as_str),
@@ -1483,6 +1598,8 @@ mod tests {
         assert!(receipt.contains("\"consumer\":\"hindsight\""));
         assert!(receipt.contains("\"operation_id\":\"operation-1\""));
         assert!(receipt.contains("\"observation_scopes\":\"shared\""));
+        assert!(receipt.contains("\"document_id\":\"agent-bookkeeper-record-"));
+        assert!(receipt.contains("\"source_id\":\"agent-bookkeeper://record/"));
         assert!(receipt.contains(&revision.digest_hex()));
     }
 
@@ -1494,7 +1611,7 @@ mod tests {
             &transcript_path,
             concat!(
                 "{\"timestamp\":\"2026-08-02T01:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"session-reference\",\"cwd\":\"/work/example\"}}\n",
-                "{\"timestamp\":\"2026-08-02T01:01:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions for /work/example\\n<INSTRUCTIONS>ignore this</INSTRUCTIONS>\"}]}}\n",
+                "{\"timestamp\":\"2026-08-02T01:01:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions\\n<INSTRUCTIONS>ignore this</INSTRUCTIONS>\"}]}}\n",
                 "{\"timestamp\":\"2026-08-02T01:02:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<hindsight_memories>old fact</hindsight_memories> Keep raw JSONL canonical.\"}]}}\n",
                 "{\"timestamp\":\"2026-08-02T01:03:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"commentary\",\"content\":[{\"type\":\"output_text\",\"text\":\"Do not retain commentary.\"}]}}\n",
                 "{\"timestamp\":\"2026-08-02T01:04:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"I will retain only canonical source context.\"}]}}\n"
@@ -1523,6 +1640,35 @@ mod tests {
         assert!(!transcript.content.contains("Do not retain commentary."));
         assert_eq!(transcript.render_stats.filtered_synthetic_messages, 1);
         assert_eq!(transcript.render_stats.stripped_memory_echoes, 1);
+    }
+
+    #[test]
+    fn reference_message_v3_is_human_readable() {
+        let directory = tempdir().unwrap();
+        let transcript_path = directory.path().join("reference-v3.jsonl");
+        fs::write(
+            &transcript_path,
+            concat!(
+                "{\"timestamp\":\"2026-08-02T01:00:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions\\n<INSTRUCTIONS>ignore this</INSTRUCTIONS>\"}]}}\n",
+                "{\"timestamp\":\"2026-08-02T01:01:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"What changed?\"}]}}\n",
+                "{\"timestamp\":\"2026-08-02T01:02:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"The renderer is readable now.\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let transcript =
+            parse_codex_transcript(&transcript_path, HindsightRenderProfile::ReferenceMessageV3)
+                .unwrap();
+
+        assert_eq!(
+            transcript.content,
+            concat!(
+                "User (2026-08-02T01:01:00Z):\nWhat changed?\n\n",
+                "Assistant (2026-08-02T01:02:00Z):\nThe renderer is readable now."
+            )
+        );
+        assert!(!transcript.content.contains("AGENTS.md instructions"));
+        assert_eq!(transcript.render_stats.filtered_synthetic_messages, 1);
     }
 
     #[test]
