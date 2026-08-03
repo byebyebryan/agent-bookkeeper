@@ -41,8 +41,11 @@ Codex semantics: use final user/assistant response items, discard synthetic
 `AGENTS.md` setup text and injected-memory echoes, and optionally preserve
 bounded structured tool context. The readable `reference-message-v3` profile
 also uses a viewer-safe document key while retaining canonical source URI
-provenance. A receipt and request metadata record the chosen renderer profile,
-so trial evidence cannot be confused with older output. An optional
+provenance. The experimental `reference-turn-v4` profile emits deterministic
+user-to-next-user exchanges as separate viewer-safe documents, without inferred
+semantic boundaries or carried context. A receipt and request metadata record
+the chosen renderer profile, so trial evidence cannot be confused with older
+output. An optional
 `--observation-scopes` setting records the explicit
 Hindsight consolidation boundary (`per_tag`, `combined`, `all_combinations`, or
 `shared`) in each retain request and receipt; its default preserves the server

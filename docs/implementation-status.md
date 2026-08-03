@@ -125,7 +125,15 @@ the same selected messages as readable role-and-timestamp transcript text. It
 uses a URL-safe Hindsight document ID (`agent-bookkeeper-record-<record-id>`) so
 the Control Plane document routes work, while preserving the canonical
 `agent-bookkeeper://record/<record-id>` source URI in metadata and receipts.
-Legacy `event_msg` messages are a compatibility fallback only when no
+`reference-turn-v4` is an isolated representation experiment: it uses the same
+message filtering as v3, but emits a separate URL-safe child document for each
+deterministic user-to-next-user exchange. Its receipt lists every child document
+and is written only after all child retains succeed; a partial failure stays
+unacknowledged and safely retries with Hindsight's `replace` upsert. It carries
+no preceding-exchange context and does not infer project-specific semantic
+boundaries. It must not be used for incremental active-session ingestion until
+child-document deletion/revision policy has separately been reviewed. Legacy
+`event_msg` messages are a compatibility fallback only when no
 response-item conversation exists. The request carries canonical revision,
 event, logical location, session metadata, renderer profile and filter counts,
 plus a conservative agent/workspace tag. A revision update uses Hindsight's

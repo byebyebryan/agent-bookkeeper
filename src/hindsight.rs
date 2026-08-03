@@ -91,13 +91,15 @@ pub trait HindsightRunner {
 /// remove recalled-memory echoes. `ReferenceToolAware` additionally preserves
 /// bounded structured tool context. `ReferenceMessageV3` preserves the same
 /// message selection but renders it as readable transcript text for Hindsight's
-/// document viewer.
+/// document viewer. `ReferenceTurnV4` emits deterministic user-to-next-user
+/// exchange documents without carrying prior context.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HindsightRenderProfile {
     LegacyV1,
     ReferenceMessage,
     ReferenceToolAware,
     ReferenceMessageV3,
+    ReferenceTurnV4,
 }
 
 impl HindsightRenderProfile {
@@ -107,6 +109,7 @@ impl HindsightRenderProfile {
             Self::ReferenceMessage => "reference-message-v2",
             Self::ReferenceToolAware => "reference-tool-aware-v2",
             Self::ReferenceMessageV3 => "reference-message-v3",
+            Self::ReferenceTurnV4 => "reference-turn-v4",
         }
     }
 
@@ -116,8 +119,9 @@ impl HindsightRenderProfile {
             "reference-message-v2" => Ok(Self::ReferenceMessage),
             "reference-tool-aware-v2" => Ok(Self::ReferenceToolAware),
             "reference-message-v3" => Ok(Self::ReferenceMessageV3),
+            "reference-turn-v4" => Ok(Self::ReferenceTurnV4),
             _ => Err(HindsightConsumerError::InvalidConfiguration(format!(
-                "unknown Hindsight render profile {value:?}; expected legacy-v1, reference-message-v2, reference-tool-aware-v2, or reference-message-v3"
+                "unknown Hindsight render profile {value:?}; expected legacy-v1, reference-message-v2, reference-tool-aware-v2, reference-message-v3, or reference-turn-v4"
             ))),
         }
     }
@@ -127,11 +131,16 @@ impl HindsightRenderProfile {
             Self::LegacyV1 => "1",
             Self::ReferenceMessage | Self::ReferenceToolAware => "2",
             Self::ReferenceMessageV3 => "3",
+            Self::ReferenceTurnV4 => "4",
         }
     }
 
     const fn uses_url_safe_document_id(self) -> bool {
-        matches!(self, Self::ReferenceMessageV3)
+        matches!(self, Self::ReferenceMessageV3 | Self::ReferenceTurnV4)
+    }
+
+    const fn uses_turn_documents(self) -> bool {
+        matches!(self, Self::ReferenceTurnV4)
     }
 }
 
@@ -330,14 +339,29 @@ impl<R> HindsightConsumer<R> {
     }
 
     /// Returns the Hindsight document key for a delivery. The human/provenance
-    /// source ID remains a URI in request metadata and receipts; the v3 viewer
-    /// renderer uses a URL-safe key because the Control Plane routes document
+    /// source ID remains a URI in request metadata and receipts; the viewer
+    /// renderers use a URL-safe key because the Control Plane routes document
     /// IDs through a single Next.js path segment.
     pub fn document_id(delivery: &DeliveryLease, render_profile: HindsightRenderProfile) -> String {
         if render_profile.uses_url_safe_document_id() {
             format!("agent-bookkeeper-record-{}", delivery.record_id.as_uuid())
         } else {
             Self::source_id(delivery)
+        }
+    }
+
+    fn document_ids(
+        delivery: &DeliveryLease,
+        render_profile: HindsightRenderProfile,
+        document_count: usize,
+    ) -> Vec<String> {
+        let document_id = Self::document_id(delivery, render_profile);
+        if render_profile.uses_turn_documents() {
+            (1..=document_count)
+                .map(|index| format!("{document_id}-turn-{index:04}"))
+                .collect()
+        } else {
+            vec![document_id]
         }
     }
 }
@@ -361,18 +385,36 @@ impl<R: HindsightRunner> HindsightConsumer<R> {
             (None, None) => None,
         };
         let source_id = Self::source_id(delivery);
-        let document_id = Self::document_id(delivery, self.render_profile);
+        let transcript = if payload_revision.is_some() {
+            Some(parse_codex_transcript(
+                payload.expect("payload matched a revision"),
+                self.render_profile,
+            )?)
+        } else {
+            None
+        };
+        let document_count = transcript
+            .as_ref()
+            .map(|transcript| {
+                if self.render_profile.uses_turn_documents() {
+                    transcript.turn_documents.len()
+                } else {
+                    1
+                }
+            })
+            .unwrap_or(1);
+        let document_ids = Self::document_ids(delivery, self.render_profile, document_count);
         let destination = self.receipt_path(delivery);
         if destination.exists() {
             let expected = receipt_bytes(
                 delivery,
                 payload_revision,
                 &source_id,
-                &document_id,
+                &document_ids,
                 &self.bank_id,
                 self.render_profile,
                 self.observation_scopes,
-                None,
+                &[],
             );
             let existing = fs::read(&destination)?;
             if receipt_matches(&existing, &expected)? {
@@ -381,40 +423,59 @@ impl<R: HindsightRunner> HindsightConsumer<R> {
             return Err(HindsightConsumerError::IdempotencyConflict(destination));
         }
 
-        let response = if let Some(revision) = payload_revision {
-            let transcript = parse_codex_transcript(
-                payload.expect("payload matched a revision"),
-                self.render_profile,
-            )?;
-            let request = retain_request(
-                delivery,
-                revision,
-                &self.bank_id,
-                source_id.clone(),
-                document_id.clone(),
-                self.render_profile,
-                self.observation_scopes,
-                transcript,
-            )?;
-            Some(
-                self.runner
+        let operation_ids = if let Some(revision) = payload_revision {
+            let transcript = transcript.expect("payload revision has a parsed transcript");
+            let documents = if self.render_profile.uses_turn_documents() {
+                transcript.turn_documents.clone()
+            } else {
+                vec![RenderedTurnDocument {
+                    content: transcript.content.clone(),
+                    timestamp: transcript.last_timestamp.clone(),
+                    start_timestamp: None,
+                    message_count: transcript.render_stats.included_messages,
+                    turn_index: 1,
+                }]
+            };
+            if documents.len() != document_ids.len() {
+                return Err(HindsightConsumerError::InvalidTranscript(
+                    "turn rendering did not produce a stable document ID for every turn".to_owned(),
+                ));
+            }
+            let mut operation_ids = Vec::new();
+            for (document, document_id) in documents.iter().zip(&document_ids) {
+                let request = retain_request(
+                    delivery,
+                    revision,
+                    &self.bank_id,
+                    source_id.clone(),
+                    document_id.clone(),
+                    self.render_profile,
+                    self.observation_scopes,
+                    &transcript,
+                    document,
+                )?;
+                if let Some(operation_id) = self
+                    .runner
                     .retain(&request)
-                    .map_err(HindsightConsumerError::Runner)?,
-            )
+                    .map_err(HindsightConsumerError::Runner)?
+                    .operation_id
+                {
+                    operation_ids.push(operation_id);
+                }
+            }
+            operation_ids
         } else {
-            None
+            Vec::new()
         };
         let receipt = receipt_bytes(
             delivery,
             payload_revision,
             &source_id,
-            &document_id,
+            &document_ids,
             &self.bank_id,
             self.render_profile,
             self.observation_scopes,
-            response
-                .as_ref()
-                .and_then(|value| value.operation_id.as_deref()),
+            &operation_ids,
         );
         write_receipt(&destination, &receipt)?;
         Ok(receipt_outcome(delivery))
@@ -439,6 +500,16 @@ struct CodexTranscript {
     session_cwd: Option<String>,
     last_timestamp: Option<String>,
     render_stats: CodexRenderStats,
+    turn_documents: Vec<RenderedTurnDocument>,
+}
+
+#[derive(Clone, Debug)]
+struct RenderedTurnDocument {
+    content: String,
+    timestamp: Option<String>,
+    start_timestamp: Option<String>,
+    message_count: u64,
+    turn_index: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -452,7 +523,7 @@ struct CodexRenderStats {
     truncated_tool_results: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RenderedMessage {
     role: &'static str,
     content: Vec<Value>,
@@ -551,7 +622,8 @@ fn parse_codex_transcript(
                         }
                         match profile {
                             HindsightRenderProfile::ReferenceMessage
-                            | HindsightRenderProfile::ReferenceMessageV3 => {
+                            | HindsightRenderProfile::ReferenceMessageV3
+                            | HindsightRenderProfile::ReferenceTurnV4 => {
                                 messages.push(RenderedMessage {
                                     role,
                                     content: vec![json!({"type": "text", "text": text})],
@@ -654,13 +726,12 @@ fn parse_codex_transcript(
                 }
                 match profile {
                     HindsightRenderProfile::ReferenceMessage
-                    | HindsightRenderProfile::ReferenceMessageV3 => {
-                        messages.push(RenderedMessage {
-                            role,
-                            content: vec![json!({"type": "text", "text": text})],
-                            timestamp: timestamp.clone(),
-                        })
-                    }
+                    | HindsightRenderProfile::ReferenceMessageV3
+                    | HindsightRenderProfile::ReferenceTurnV4 => messages.push(RenderedMessage {
+                        role,
+                        content: vec![json!({"type": "text", "text": text})],
+                        timestamp: timestamp.clone(),
+                    }),
                     HindsightRenderProfile::ReferenceToolAware if role == "user" => {
                         flush_assistant(
                             &mut messages,
@@ -721,10 +792,17 @@ fn parse_codex_transcript(
         .iter()
         .rev()
         .find_map(|message| message.timestamp.clone());
-    let content = match profile {
-        HindsightRenderProfile::ReferenceMessageV3 => render_readable_messages(&messages),
-        HindsightRenderProfile::ReferenceMessage | HindsightRenderProfile::ReferenceToolAware => {
-            serde_json::to_string(
+    let turn_documents = if profile.uses_turn_documents() {
+        render_turn_documents(&messages)
+    } else {
+        Vec::new()
+    };
+    let content =
+        match profile {
+            HindsightRenderProfile::ReferenceMessageV3
+            | HindsightRenderProfile::ReferenceTurnV4 => render_readable_messages(&messages),
+            HindsightRenderProfile::ReferenceMessage
+            | HindsightRenderProfile::ReferenceToolAware => serde_json::to_string(
                 &messages
                     .iter()
                     .map(|message| {
@@ -736,16 +814,16 @@ fn parse_codex_transcript(
                     })
                     .collect::<Vec<_>>(),
             )
-            .expect("Codex render values serialize without error")
-        }
-        HindsightRenderProfile::LegacyV1 => unreachable!(),
-    };
+            .expect("Codex render values serialize without error"),
+            HindsightRenderProfile::LegacyV1 => unreachable!(),
+        };
     Ok(CodexTranscript {
         content,
         session_id,
         session_cwd,
         last_timestamp,
         render_stats: stats,
+        turn_documents,
     })
 }
 
@@ -828,6 +906,7 @@ fn parse_legacy_codex_transcript(path: &Path) -> Result<CodexTranscript, Hindsig
         session_cwd,
         last_timestamp,
         render_stats: stats,
+        turn_documents: Vec::new(),
     })
 }
 
@@ -863,6 +942,36 @@ fn render_readable_messages(messages: &[RenderedMessage]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn render_turn_documents(messages: &[RenderedMessage]) -> Vec<RenderedTurnDocument> {
+    let mut turns = Vec::new();
+    let mut current = Vec::new();
+    for message in messages {
+        if message.role == "user" && !current.is_empty() {
+            turns.push(std::mem::take(&mut current));
+        }
+        current.push(message.clone());
+    }
+    if !current.is_empty() {
+        turns.push(current);
+    }
+    turns
+        .into_iter()
+        .enumerate()
+        .map(|(index, messages)| RenderedTurnDocument {
+            content: render_readable_messages(&messages),
+            timestamp: messages
+                .iter()
+                .rev()
+                .find_map(|message| message.timestamp.clone()),
+            start_timestamp: messages
+                .iter()
+                .find_map(|message| message.timestamp.clone()),
+            message_count: messages.len() as u64,
+            turn_index: (index + 1) as u64,
+        })
+        .collect()
 }
 
 fn render_message_blocks(blocks: &[Value]) -> String {
@@ -1151,7 +1260,8 @@ fn retain_request(
     document_id: String,
     render_profile: HindsightRenderProfile,
     observation_scopes: Option<HindsightObservationScopes>,
-    transcript: CodexTranscript,
+    transcript: &CodexTranscript,
+    document: &RenderedTurnDocument,
 ) -> Result<HindsightRetainRequest, HindsightConsumerError> {
     let mut metadata = BTreeMap::from([
         ("source_id".to_owned(), source_id.clone()),
@@ -1233,6 +1343,19 @@ fn retain_request(
     if let Some(session_cwd) = &transcript.session_cwd {
         metadata.insert("session_cwd".to_owned(), session_cwd.clone());
     }
+    if render_profile.uses_turn_documents() {
+        metadata.insert("turn_index".to_owned(), document.turn_index.to_string());
+        metadata.insert(
+            "turn_message_count".to_owned(),
+            document.message_count.to_string(),
+        );
+        if let Some(start_timestamp) = &document.start_timestamp {
+            metadata.insert("turn_start_timestamp".to_owned(), start_timestamp.clone());
+        }
+        if let Some(end_timestamp) = &document.timestamp {
+            metadata.insert("turn_end_timestamp".to_owned(), end_timestamp.clone());
+        }
+    }
     let workspace = transcript
         .session_cwd
         .as_deref()
@@ -1244,7 +1367,8 @@ fn retain_request(
         HindsightRenderProfile::LegacyV1 => "Codex agent-session transcript".to_owned(),
         HindsightRenderProfile::ReferenceMessage
         | HindsightRenderProfile::ReferenceToolAware
-        | HindsightRenderProfile::ReferenceMessageV3 => {
+        | HindsightRenderProfile::ReferenceMessageV3
+        | HindsightRenderProfile::ReferenceTurnV4 => {
             "Conversation between a human collaborator (User) and the Codex coding agent (Assistant).".to_owned()
         }
     };
@@ -1253,7 +1377,8 @@ fn retain_request(
             HindsightRenderProfile::LegacyV1 => context.push_str(" from workspace "),
             HindsightRenderProfile::ReferenceMessage
             | HindsightRenderProfile::ReferenceToolAware
-            | HindsightRenderProfile::ReferenceMessageV3 => context.push_str(" Workspace: "),
+            | HindsightRenderProfile::ReferenceMessageV3
+            | HindsightRenderProfile::ReferenceTurnV4 => context.push_str(" Workspace: "),
         }
         context.push_str(session_cwd);
     }
@@ -1261,9 +1386,9 @@ fn retain_request(
         bank_id: bank_id.to_owned(),
         document_id,
         source_id,
-        content: transcript.content,
+        content: document.content.clone(),
         context,
-        timestamp: transcript.last_timestamp,
+        timestamp: document.timestamp.clone(),
         metadata,
         tags: vec!["agent:codex".to_owned(), format!("workspace:{workspace}")],
         observation_scopes,
@@ -1342,12 +1467,16 @@ fn receipt_bytes(
     delivery: &DeliveryLease,
     payload: Option<CanonicalRevision>,
     source_id: &str,
-    document_id: &str,
+    document_ids: &[String],
     bank_id: &str,
     render_profile: HindsightRenderProfile,
     observation_scopes: Option<HindsightObservationScopes>,
-    operation_id: Option<&str>,
+    operation_ids: &[String],
 ) -> Vec<u8> {
+    let document_id = document_ids
+        .first()
+        .expect("a Hindsight delivery has at least one document ID");
+    let operation_id = (operation_ids.len() == 1).then(|| operation_ids[0].as_str());
     let location = delivery.location.as_ref().map(|location| {
         json!({
             "root_role": location.root_role(),
@@ -1362,7 +1491,7 @@ fn receipt_bytes(
         })
     });
     let mut receipt = json!({
-        "format_version": 1,
+        "format_version": if document_ids.len() == 1 { 1 } else { 2 },
         "consumer": "hindsight",
         "subscription_id": delivery.subscription_id.as_uuid().to_string(),
         "event_id": delivery.event_id.as_uuid().to_string(),
@@ -1382,6 +1511,12 @@ fn receipt_bytes(
     if let Some(observation_scopes) = observation_scopes {
         receipt["observation_scopes"] = Value::String(observation_scopes.name().to_owned());
     }
+    if document_ids.len() > 1 {
+        receipt["document_ids"] = json!(document_ids);
+    }
+    if operation_ids.len() > 1 {
+        receipt["operation_ids"] = json!(operation_ids);
+    }
     let mut output = serde_json::to_vec(&receipt).expect("JSON values serialize without error");
     output.push(b'\n');
     output
@@ -1399,10 +1534,18 @@ fn receipt_matches(existing: &[u8], expected: &[u8]) -> Result<bool, HindsightCo
         .as_object_mut()
         .expect("receipt JSON is an object")
         .remove("operation_id");
+    existing
+        .as_object_mut()
+        .expect("receipt JSON is an object")
+        .remove("operation_ids");
     expected
         .as_object_mut()
         .expect("receipt JSON is an object")
         .remove("operation_id");
+    expected
+        .as_object_mut()
+        .expect("receipt JSON is an object")
+        .remove("operation_ids");
     Ok(existing == expected)
 }
 
@@ -1484,7 +1627,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_adapter_renders_readable_messages_with_a_viewer_safe_document_id() {
+    fn turn_v4_adapter_writes_one_receipt_after_retaining_each_exchange() {
         let directory = tempdir().unwrap();
         let source_root = directory.path().join("source");
         let cache_root = directory.path().join("cache");
@@ -1495,6 +1638,8 @@ mod tests {
             "{\"timestamp\":\"2026-08-01T01:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Keep raw JSONL canonical.\"}}\n",
             "{\"timestamp\":\"2026-08-01T01:01:30Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"custom_tool_call\",\"message\":\"must not send\"}}\n",
             "{\"timestamp\":\"2026-08-01T01:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"I will use an adapter.\"}}\n"
+            ,"{\"timestamp\":\"2026-08-01T01:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"What was verified?\"}}\n"
+            ,"{\"timestamp\":\"2026-08-01T01:04:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"The source is canonical.\"}}\n"
         )
         .as_bytes();
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -1528,7 +1673,7 @@ mod tests {
         let mut consumer = HindsightConsumer::new_with_render_profile_and_observation_scopes(
             &receipt_root,
             "codex-pilot",
-            HindsightRenderProfile::ReferenceMessageV3,
+            HindsightRenderProfile::ReferenceTurnV4,
             Some(HindsightObservationScopes::Shared),
             runner,
         )
@@ -1546,7 +1691,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.attempts.len(), 1);
-        assert_eq!(consumer.runner.requests.len(), 1);
+        assert_eq!(consumer.runner.requests.len(), 2);
         let request = &consumer.runner.requests[0];
         assert!(
             request
@@ -1561,7 +1706,10 @@ mod tests {
         assert!(!request.content.contains("must not send"));
         assert_eq!(
             request.document_id,
-            format!("agent-bookkeeper-record-{}", request.metadata["record_id"])
+            format!(
+                "agent-bookkeeper-record-{}-turn-0001",
+                request.metadata["record_id"]
+            )
         );
         assert_eq!(
             request.source_id,
@@ -1571,6 +1719,23 @@ mod tests {
             )
         );
         assert_eq!(request.timestamp.as_deref(), Some("2026-08-01T01:02:00Z"));
+        let second_request = &consumer.runner.requests[1];
+        assert!(second_request.content.contains("What was verified?"));
+        assert!(second_request.content.contains("The source is canonical."));
+        assert_eq!(
+            second_request.document_id,
+            format!(
+                "agent-bookkeeper-record-{}-turn-0002",
+                second_request.metadata["record_id"]
+            )
+        );
+        assert_eq!(
+            second_request
+                .metadata
+                .get("turn_index")
+                .map(String::as_str),
+            Some("2")
+        );
         assert_eq!(
             request.metadata.get("session_id").map(String::as_str),
             Some("session-a")
@@ -1596,9 +1761,11 @@ mod tests {
         )
         .unwrap();
         assert!(receipt.contains("\"consumer\":\"hindsight\""));
-        assert!(receipt.contains("\"operation_id\":\"operation-1\""));
+        assert!(receipt.contains("\"operation_ids\":[\"operation-1\",\"operation-1\"]"));
         assert!(receipt.contains("\"observation_scopes\":\"shared\""));
+        assert!(receipt.contains("\"format_version\":2"));
         assert!(receipt.contains("\"document_id\":\"agent-bookkeeper-record-"));
+        assert!(receipt.contains("\"document_ids\":[\"agent-bookkeeper-record-"));
         assert!(receipt.contains("\"source_id\":\"agent-bookkeeper://record/"));
         assert!(receipt.contains(&revision.digest_hex()));
     }
@@ -1669,6 +1836,49 @@ mod tests {
         );
         assert!(!transcript.content.contains("AGENTS.md instructions"));
         assert_eq!(transcript.render_stats.filtered_synthetic_messages, 1);
+    }
+
+    #[test]
+    fn reference_turn_v4_splits_at_user_messages_without_carrying_context() {
+        let directory = tempdir().unwrap();
+        let transcript_path = directory.path().join("turn-v4.jsonl");
+        fs::write(
+            &transcript_path,
+            concat!(
+                "{\"timestamp\":\"2026-08-02T01:01:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"First request\"}]}}\n",
+                "{\"timestamp\":\"2026-08-02T01:02:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"First response\"}]}}\n",
+                "{\"timestamp\":\"2026-08-02T01:03:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Second request\"}]}}\n",
+                "{\"timestamp\":\"2026-08-02T01:04:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"Second response\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let transcript =
+            parse_codex_transcript(&transcript_path, HindsightRenderProfile::ReferenceTurnV4)
+                .unwrap();
+
+        assert_eq!(transcript.turn_documents.len(), 2);
+        assert_eq!(transcript.turn_documents[0].turn_index, 1);
+        assert_eq!(transcript.turn_documents[0].message_count, 2);
+        assert!(
+            transcript.turn_documents[0]
+                .content
+                .contains("First request")
+        );
+        assert!(
+            transcript.turn_documents[0]
+                .content
+                .contains("First response")
+        );
+        assert!(
+            !transcript.turn_documents[0]
+                .content
+                .contains("Second request")
+        );
+        assert_eq!(
+            transcript.turn_documents[1].timestamp.as_deref(),
+            Some("2026-08-02T01:04:00Z")
+        );
     }
 
     #[test]
