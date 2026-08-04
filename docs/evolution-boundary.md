@@ -40,7 +40,7 @@ on a particular V1 filesystem layout or consumer product.
 | Chunk/object store | Absent | Added | New V2 component. |
 | Canonical commit receipts | Ledger events over observed files | Added as durable raw-storage receipts | Indexed into the same catalog. |
 | Current projection writer | Borrowed external mirror | Added as asynchronous rebuildable compatibility/export view | Consumer eligibility remains ledger plus `RevisionReader`. |
-| MemPalace/Hindsight-specific logic | Outside Bookkeeper | Outside Bookkeeper | Integration belongs to Agent Historian or deployment adapters. |
+| MemPalace archive-search adapter | Controlled consumer cohort | Reused against committed objects | Part of the Bookkeeper product; the raw archive remains canonical and the search index remains rebuildable. |
 
 ## V1.5 decisions that constrain V2
 
@@ -100,10 +100,10 @@ Do not publish a stable V2 protocol version before then.
 
 | Project/layer | Owns |
 | --- | --- |
-| Agent Bookkeeper | Raw capture, transport, archive identities/revisions, durable commit ledger, verified payload access, rebuildable current projection, and consumer delivery. |
-| Agent Historian | Composition, consumer selection, ingestion policy, retrieval/learned-memory integration, and operator-facing memory workflows. |
-| Evidence/search consumer | Parsing, semantic chunks, embeddings, retrieval index, and provenance-bearing search. |
-| Learned-memory consumer | Retain/recall semantics, synthesis, confidence, and deletion behavior in learned context. |
+| Agent Bookkeeper | Raw capture, transport, archive identities/revisions, durable commit ledger, verified payload access, rebuildable current projection, and MemPalace-backed archive/search integration. |
+| Agent Historian | Architecture research, optional learned-context evaluation, and operator-facing continuity workflows. |
+| Archive-search backend | Parsing, semantic chunks, embeddings, retrieval index, and provenance-bearing search behind Bookkeeper's integration boundary. |
+| Optional learned-context workflow | Agent-led, evidence-backed candidate authoring, synthesis, confidence, and correction behavior outside Bookkeeper's archive cursor. |
 | Deployment repository | Concrete hosts, networks, storage paths, credentials, resource limits, and backup policy. |
 
 Bookkeeper may ship provider and generic delivery adapters, but it must not

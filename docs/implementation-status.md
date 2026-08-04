@@ -84,7 +84,7 @@ reads a verified lease-scoped payload, verifies its canonical revision again,
 and atomically writes only a provenance manifest keyed by subscription and
 event. Reapplying the same event validates the existing manifest rather than
 creating a duplicate derived effect. It is a local proof adapter, not a
-replacement for a search or learned-memory consumer.
+replacement for the archive-search backend.
 
 ## Implemented in progress: MemPalace controlled-cohort adapter
 
@@ -109,50 +109,6 @@ one-shot run: it reuses one durable subscription by consumer ID, scans the
 operator-provided active and archived roots twice for stability, applies the
 hard record-size and run budgets, then prints a content-free JSON summary. It
 does not install a timer, perform transport, or start a background worker.
-
-## Implemented in progress: Hindsight learned-memory adapter
-
-`HindsightConsumer` is a separate, synchronous consumer subscription for a
-Hindsight-compatible HTTP API. It re-verifies the materialized lease revision,
-has a stable `legacy-v1` renderer plus opt-in reference profiles. The
-reference profiles follow Hindsight's maintained Codex integration: they prefer
-`response_item` user messages and assistant `final_answer` messages, drop
-synthetic `AGENTS.md` setup text, and strip Hindsight-injected memory echoes.
-`reference-message-v2` retains structured user/assistant text only;
-`reference-tool-aware-v2` additionally groups tool calls and bounded (2,000
-character) tool results under assistant turns. `reference-message-v3` retains
-the same selected messages as readable role-and-timestamp transcript text. It
-uses a URL-safe Hindsight document ID (`agent-bookkeeper-record-<record-id>`) so
-the Control Plane document routes work, while preserving the canonical
-`agent-bookkeeper://record/<record-id>` source URI in metadata and receipts.
-`reference-turn-v4` is an isolated representation experiment: it uses the same
-message filtering as v3, but emits a separate URL-safe child document for each
-deterministic user-to-next-user exchange. Its receipt lists every child document
-and is written only after all child retains succeed; a partial failure stays
-unacknowledged and safely retries with Hindsight's `replace` upsert. It carries
-no preceding-exchange context and does not infer project-specific semantic
-boundaries. It must not be used for incremental active-session ingestion until
-child-document deletion/revision policy has separately been reviewed. Legacy
-`event_msg` messages are a compatibility fallback only when no
-response-item conversation exists. The request carries canonical revision,
-event, logical location, session metadata, renderer profile and filter counts,
-plus a conservative agent/workspace tag. A revision update uses Hindsight's
-`replace` upsert mode; a retry after a lost Bookkeeper acknowledgement is
-therefore safe. A durable receipt is written only after the HTTP retain request
-succeeds. An operator may pass `--observation-scopes` to
-set Hindsight's explicit consolidation boundary for that replay; the setting is
-included in the request and receipt, while the default leaves the Hindsight
-server default unchanged.
-
-`agent-bookkeeper-hindsight-controller` uses the same bounded reconciliation
-and delivery limits as the MemPalace controller, but owns a distinct consumer
-cursor and receipt root. It is intentionally a manual one-shot: service
-unavailability becomes a normal queued retry, not an agent-hook failure. A
-metadata-only tombstone is `ignored_by_policy` because deletion of learned facts
-needs a separately reviewed correction/retention policy. A controlled run may
-pass `--include-manifest` with one root-relative JSONL path per line; the
-controller rejects an empty, duplicate, or absolute entry and makes unlisted
-files invisible for that source configuration.
 
 ## Implemented in progress: verified external payload reader
 
@@ -239,8 +195,8 @@ revision, and event state.
    measurements and source health/readiness integration for deployment.
 2. Finish payload and delivery: consumer filters and explicit
    unavailable-revision policy.
-3. Operational proof: bounded MemPalace and Hindsight consumer cohorts with
-   provenance, retrieval, and learned-memory relevance acceptance evidence.
+3. Operational proof: bounded MemPalace archive-search cohorts with provenance,
+   retrieval, and resource acceptance evidence.
 
 ## Validation
 

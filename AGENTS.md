@@ -12,4 +12,7 @@
 
 ## Scope boundary
 
-Agent Bookkeeper owns capture, delivery, durable raw archival, and revision-aware cataloging of agent-session records. It does not decide semantic memory, retrieve evidence for users, or derive learned context.
+Agent Bookkeeper owns capture, delivery, durable raw archival, revision-aware
+cataloging, and the archive-search integration that makes session evidence
+retrievable with provenance. It does not decide semantic memory, author learned
+context, or replace current repository state with derived history.

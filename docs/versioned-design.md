@@ -33,8 +33,8 @@ V1.5 adds a service-packaged controller that reads the V1 raw mirror without tak
 - coalesces work so an archive of many files does not cause a simultaneous full re-ingestion burst.
 
 This layer separates ingestion policy from transport. An evidence archive can
-ingest a completed session while a learned-memory system advances at a different
-rate or is disabled entirely. A path move changes location metadata instead of
+ingest a completed session while an archive-search backend advances at a
+different rate or is disabled entirely. A path move changes location metadata instead of
 being reclassified as a wholly new record. If derived consumer state becomes
 unsuitable, V1.5 can `rebuild_current` from the latest verified mirror bytes.
 Lossless historical byte replay requires retained V2 payloads; V1.5 preserves

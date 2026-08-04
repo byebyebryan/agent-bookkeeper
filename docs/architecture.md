@@ -2,7 +2,11 @@
 
 ## Purpose
 
-Agent Bookkeeper preserves agent-session records as durable, replayable evidence and exposes them to multiple independent consumers. A deployment must provide storage that is both durable and reachable from the archive service or transport destination. The project deliberately does not prescribe a particular filesystem, object store, host, or network.
+Agent Bookkeeper preserves agent-session records as durable, replayable evidence
+and makes them retrievable through an archive-search backend. A deployment must
+provide storage that is both durable and reachable from the archive service or
+transport destination. The project deliberately does not prescribe a particular
+filesystem, object store, host, or network.
 
 ## Ownership boundary
 
@@ -12,11 +16,12 @@ Bookkeeper owns:
 - stable identity and revision tracking for raw records;
 - queued, resumable delivery;
 - a canonical raw archive and its catalog;
+- archive-search ingestion, provenance, and retrieval integration;
 - consumer cursors and delivery state.
 
 Bookkeeper does not own:
 
-- embedding, chunking for semantic retrieval, or search ranking;
+- the internal algorithms of a selected search backend;
 - inferred facts, learned preferences, or memory-promotion policy;
 - agent execution or lifecycle policy beyond a minimal trigger integration.
 
@@ -36,9 +41,9 @@ transport adapter ---------------> archive service or compatible destination
                                                 v
                                     committed raw archive + catalog
                                                 |
-                          +---------------------+---------------------+
-                          v                                           v
-                 evidence/search consumer                     learned-memory consumer
+                                                v
+                                  archive-search backend and provenance API
+                                  MemPalace initially
 ```
 
 The hook only requests a scan and returns. It must not synchronously upload transcripts, wait for a remote endpoint, or run embedding. The client records pending work locally; a detached worker coalesces scans, retries failed delivery, and checks outstanding work on every later trigger.
@@ -52,15 +57,15 @@ current-byte source and Bookkeeper adds a durable observation ledger. In V2,
 Bookkeeper's committed objects and receipts are canonical together.
 
 Current projections, materialization caches, scan fingerprints, catalog indexes,
-and downstream retrieval indexes and learned memories are rebuildable. Pending
-client delivery work and consumer cursors/outcomes are durable operational state
-and must survive ordinary restarts. If consumer delivery state is deliberately
-rebuilt from archive events, it uses a new subscription epoch rather than
-pretending to restore prior acknowledgements.
+and archive-search indexes are rebuildable. Pending client delivery work and
+consumer cursors/outcomes are durable operational state and must survive ordinary
+restarts. If consumer delivery state is deliberately rebuilt from archive events,
+it uses a new subscription epoch rather than pretending to restore prior
+acknowledgements.
 
-Consumers read only committed archive events and maintain independent delivery
-state. A consumer failure must never block receipt of raw records or corrupt
-another consumer's progress.
+The archive-search backend reads only committed archive events and maintains
+independent delivery state. Its failure must never block receipt of raw records
+or corrupt archive progress.
 
 ## Stable record model
 

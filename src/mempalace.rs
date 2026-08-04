@@ -1,8 +1,9 @@
 //! A provenance-preserving MemPalace consumer for controlled V1.5 cohorts.
 //!
-//! The adapter has no retrieval or learned-memory policy. It gives MemPalace
-//! a verified lease-scoped JSONL path and a stable Bookkeeper record identity,
-//! then writes an idempotent receipt only after the external command succeeds.
+//! The adapter gives MemPalace a verified lease-scoped JSONL path and a stable
+//! Bookkeeper record identity, then writes an idempotent receipt only after the
+//! external command succeeds. The derived index never replaces canonical raw
+//! archive evidence.
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};

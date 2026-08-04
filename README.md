@@ -1,12 +1,17 @@
 # Agent Bookkeeper
 
-Agent Bookkeeper is a reusable data plane for preserving raw agent-session evidence: local discovery, reliable delivery, durable storage, and revision-aware cataloging. It gives memory and analysis systems one trustworthy, replayable source of records without coupling them to an individual workstation or storage topology.
+Agent Bookkeeper is a reusable archive-search system for agent-session evidence:
+local discovery, reliable delivery, durable storage, revision-aware cataloging,
+and provenance-bearing retrieval. It gives agents one trustworthy, replayable
+source of historical records without coupling them to an individual workstation
+or storage topology.
 
 It complements, rather than replaces, an overall memory system such as [Agent Historian](https://github.com/byebyebryan/agent-historian):
 
 - **Bookkeeper** records what happened and makes the raw evidence durably available.
-- An archive or retrieval consumer turns those records into searchable evidence.
-- A learned-memory consumer may derive concise, fallible working context from that evidence.
+- Its archive-search backend indexes that evidence for semantic and keyword retrieval.
+- The current checkout, repository documentation, and decision records remain
+  authoritative over any derived historical interpretation.
 
 ## Implementation status
 
@@ -33,30 +38,12 @@ not a standing worker or a general promotion claim.
 The `agent-bookkeeper-mempalace-controller` binary is the corresponding
 explicit one-shot runner. It requires absolute operator-supplied paths, two
 stability scans, a hash budget, a hard per-record cohort limit, a delivery
-count/byte limit, and a local MemPalace CLI. The companion
-`agent-bookkeeper-hindsight-controller` drives a synchronous Hindsight retain
-adapter through its HTTP API. Its stable legacy renderer is retained for an
-existing pilot, while opt-in reference profiles follow Hindsight's maintained
-Codex semantics: use final user/assistant response items, discard synthetic
-`AGENTS.md` setup text and injected-memory echoes, and optionally preserve
-bounded structured tool context. The readable `reference-message-v3` profile
-also uses a viewer-safe document key while retaining canonical source URI
-provenance. The experimental `reference-turn-v4` profile emits deterministic
-user-to-next-user exchanges as separate viewer-safe documents, without inferred
-semantic boundaries or carried context. A receipt and request metadata record
-the chosen renderer profile, so trial evidence cannot be confused with older
-output. An optional
-`--observation-scopes` setting records the explicit
-Hindsight consolidation boundary (`per_tag`, `combined`, `all_combinations`, or
-`shared`) in each retain request and receipt; its default preserves the server
-default. An optional source-relative include manifest makes a cohort an exact
-allowlist rather than a size-limited prefix of a larger archive. The adapter
-stamps every retain with record/revision provenance and uses a stable
-`document_id` so retries replace rather than duplicate learned facts. Both
-controllers own only their SQLite ledger, lease cache, and receipts; they never
-perform client transport or start a timer. The optional Dockerfiles provide
-image layers while the operator supplies all runtime paths, endpoints, and
-limits.
+count/byte limit, and a local MemPalace CLI. An optional source-relative include
+manifest makes a cohort an exact allowlist rather than a size-limited prefix of
+a larger archive. The controller owns only its SQLite ledger, lease cache, and
+receipts; it never performs client transport or starts a timer. Its optional
+Dockerfile provides an image layer while the operator supplies all runtime
+paths, endpoints, and limits.
 See [implementation status](docs/implementation-status.md).
 
 V2's protocol is detailed but intentionally not frozen until the shared V1.5
@@ -95,7 +82,7 @@ and rebuildable current projection.
 ## Non-goals
 
 - A proprietary transcript format.
-- Semantic retrieval, embedding, or learned-memory policy.
+- Learned-memory authoring or policy.
 - A hard-coded server, network, cloud account, or storage backend.
 - Running heavyweight work inside a lifecycle hook.
 
@@ -112,7 +99,6 @@ Inspect controller arguments with:
 
 ```sh
 rtk cargo run --bin agent-bookkeeper-mempalace-controller -- --help
-rtk cargo run --bin agent-bookkeeper-hindsight-controller -- --help
 ```
 
 ## License

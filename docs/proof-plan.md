@@ -45,12 +45,10 @@ Record elapsed time, bytes sent, CPU time, and peak memory for the seed and appe
 - `rebuild_current` succeeds from current V1.5 bytes; historical byte replay
   explicitly blocks or supersedes unavailable revisions.
 - Backpressure limits consumer work so a discovery sweep does not create an uncontrolled embedding or indexing burst.
-- A learned-memory adapter retains only explicitly allowed message roles, never
-  a mutable raw path or tool output, and every recalled fact carries its
-  Bookkeeper source/revision provenance.
-- An injected Hindsight timeout or HTTP failure leaves the delivery queued;
-  retrying a successful retain with the same record document ID does not
-  duplicate learned facts.
+- An archive-search adapter receives only a verified lease-scoped path and its
+  indexed source identity carries Bookkeeper revision provenance.
+- An injected archive-search failure leaves the delivery queued; retrying after
+  a successful handoff does not duplicate its consumer effect.
 - Quiescence/revision coalescing bounds repeated hashing of one active large
   record, while a byte-budgeted scrub eventually detects same-size drift.
 - SQLite-aware backup and restore on the supported filesystem preserve event

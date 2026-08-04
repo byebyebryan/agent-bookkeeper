@@ -11,7 +11,6 @@ pub mod controller;
 pub mod delivery;
 pub mod domain;
 pub mod evidence;
-pub mod hindsight;
 pub mod measurement;
 pub mod mempalace;
 pub mod payload;
@@ -35,11 +34,6 @@ pub use domain::{
     ProducerId, RecordIdentity, RecordState,
 };
 pub use evidence::{EvidenceConsumerError, FilesystemEvidenceConsumer};
-pub use hindsight::{
-    HindsightConsumer, HindsightConsumerError, HindsightHttpConfig, HindsightHttpRunner,
-    HindsightObservationScopes, HindsightRenderProfile, HindsightRetainRequest,
-    HindsightRetainResponse, HindsightRunner,
-};
 pub use measurement::{
     MeasurementError, ProcessResources, ReconcileMeasurement, ResourceDelta, ScrubMeasurement,
     current_process_resources, measure_reconciliation, measure_scrub,
