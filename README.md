@@ -67,6 +67,7 @@ and rebuildable current projection.
 
 - [Architecture](docs/architecture.md) — scope, ownership, and data flow.
 - [Versioned design](docs/versioned-design.md) — V1, V1.5, and V2 decisions.
+- [Design lineage](docs/design-lineage.md) — how the pre-repository archive proposal maps to current contracts.
 - [Domain contract](docs/domain-contract.md) — producer/session/record identity, canonical revisions, ordering, and clocks.
 - [Payload and delivery contract](docs/payload-delivery-contract.md) — verified bytes, per-record ordering, settled outcomes, and replay modes.
 - [Durability contract](docs/durability-contract.md) — root guards, hashing/scrub, SQLite backup, receipts, cache, and crash recovery.

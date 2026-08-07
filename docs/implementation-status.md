@@ -1,7 +1,9 @@
 # Implementation status
 
 Status: active V1.5 proof. This document distinguishes executable behavior from
-the intended contracts; it is not a promotion claim.
+the intended contracts; it is not a promotion claim. An operator may have a
+working V1 raw-transcript mirror without Bookkeeper being operational: V1.5 is
+the separate proof that adds a durable catalog and controlled consumer delivery.
 
 ## Implemented: Slice 1 core and catalog
 
@@ -18,7 +20,8 @@ The Rust crate currently provides:
 
 The implementation does **not** yet claim a completed V1.5 deployment. In
 particular, no source adapter has been allowed to infer a deletion, no raw path
-has been given to a consumer, and no external consumer has been started.
+is given directly to a consumer, and an external-consumer pilot is not
+equivalent to completed cohort, recovery, and promotion evidence.
 
 ## Implemented in progress: guarded filesystem discovery
 
@@ -90,13 +93,24 @@ replacement for the archive-search backend.
 
 `MempalaceConsumer` is a concrete, command-runner-backed evidence adapter for
 Codex JSONL. It verifies the lease-scoped materialization against the canonical
-BLAKE3 revision before invoking `mempalace --palace <path> codex-stream`. It
-uses a stable `agent-bookkeeper://record/<record-id>` source ID, so an ephemeral
-materialization cache filename never becomes search provenance or an index
-identity. A durable receipt records the subscription/event idempotency key,
-logical source location, canonical revision, and source ID only after the
-command succeeds; a lost Bookkeeper acknowledgement can therefore be retried
-without a second consumer effect.
+BLAKE3 revision before invoking `mempalace --palace <path> codex-stream`. Its
+current `agent-bookkeeper://record/<record-id>` source ID is stable for retries
+while the same catalog is retained, so an ephemeral materialization cache
+filename never becomes search provenance or an index identity. A durable
+receipt records the subscription/event idempotency key, logical source
+location, canonical revision, and source ID only after the command succeeds; a
+lost Bookkeeper acknowledgement can therefore be retried without a second
+consumer effect.
+
+This is not yet the canonical archive-search source-identity contract. A record
+ID is allocated by the catalog and cannot be reconstructed from raw evidence
+alone, while a direct archive batch importer normally identifies a source by
+its input path. A fresh direct backfill and a later Bookkeeper delivery can
+therefore describe the same transcript as different MemPalace sources. Before
+wholesale archive-search backfill or index rebuild is operational, both paths
+must use one deterministic consumer-facing source ID derived from the logical
+record identity. It must survive a move between source roots and be available
+to both the batch importer and Bookkeeper delivery adapter.
 
 The streaming importer does not yet expose a record-delete operation. A
 metadata-only tombstone is durably `ignored_by_policy`, not falsely reported as
@@ -108,7 +122,36 @@ decision.
 one-shot run: it reuses one durable subscription by consumer ID, scans the
 operator-provided active and archived roots twice for stability, applies the
 hard record-size and run budgets, then prints a content-free JSON summary. It
-does not install a timer, perform transport, or start a background worker.
+does not install a timer, perform transport, or start a background worker. The
+current command also does not expose explicit selection or creation of a new
+subscription epoch, including `rebuild_current`; an index rebuild must not
+reuse an existing consumer's acknowledgements as though they applied to a new
+derived index.
+
+## Operational boundary for archive-search delivery
+
+The current controller is suitable for explicit, bounded cohorts. It is not yet
+the unattended archive-search data plane. In addition to the source-identity
+gap above, promotion requires:
+
+- a deliberate whole-archive backfill path that admits representative large
+  records, has resumable progress, and keeps its candidate index isolated from
+  a live index;
+- an explicit new-consumer/rebuild workflow that creates a fresh delivery epoch
+  and makes its receipt and acknowledgement boundary visible to the operator;
+- a deployment-owned invocation contract from a successful raw-archive commit
+  to a bounded controller run. V1.5 intentionally owns neither client network
+  transport nor a permanent workstation/server worker;
+- measured target-hardware limits for scanning, hashing, materialization, and
+  embedding, including failure and recovery behavior for large records; and
+- corpus-level MemPalace provenance and retrieval acceptance checks before a
+  candidate index is promoted.
+
+Until those gates pass, a direct, manifest-backed MemPalace import may be a
+more mature way to build archive search from canonical raw evidence. Bookkeeper
+remains valuable as the prospective catalog and controlled-delivery layer, but
+its integration must stay disabled or explicitly cohort-scoped rather than
+being represented as automatic indexing.
 
 ## Implemented in progress: verified external payload reader
 
@@ -191,12 +234,17 @@ revision, and event state.
 
 ## Remaining V1.5 slices
 
-1. Finish source operational proof: recorded representative large-record
+1. Define and prove a deterministic archive-search source identity shared by
+   direct batch import and Bookkeeper delivery, including a move and
+   seed-then-deliver convergence test.
+2. Finish source operational proof: recorded representative large-record
    measurements and source health/readiness integration for deployment.
-2. Finish payload and delivery: consumer filters and explicit
+3. Add an explicit consumer-rebuild epoch and controlled whole-archive
+   backfill workflow; do not reuse acknowledgements from a retired index.
+4. Finish payload and delivery: consumer filters and explicit
    unavailable-revision policy.
-3. Operational proof: bounded MemPalace archive-search cohorts with provenance,
-   retrieval, and resource acceptance evidence.
+5. Operational proof: bounded MemPalace archive-search cohorts with provenance,
+   retrieval, resource, trigger, and recovery acceptance evidence.
 
 ## Validation
 
