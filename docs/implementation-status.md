@@ -1,5 +1,11 @@
 # Implementation status
 
+> **Retired — October 7, 2026.** Development and adoption of the custom Agent
+> Historian / Agent Bookkeeper / MemPalace stack have ended. This repository
+> preserves the research, implementation, and unfinished plans as historical
+> material; they are not an active roadmap or deployment instructions. Native
+> agent memory and local session history remain outside this retirement.
+
 Status: active V1.5 proof. This document distinguishes executable behavior from
 the intended contracts; it is not a promotion claim.
 

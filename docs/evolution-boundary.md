@@ -1,5 +1,11 @@
 # V1.5 to V2 evolution boundary
 
+> **Retired — October 7, 2026.** Development and adoption of the custom Agent
+> Historian / Agent Bookkeeper / MemPalace stack have ended. This repository
+> preserves the research, implementation, and unfinished plans as historical
+> material; they are not an active roadmap or deployment instructions. Native
+> agent memory and local session history remain outside this retirement.
+
 This document makes the overlap and dependency explicit. V1.5 is not throwaway
 scaffolding, and V2 is not a rewrite of the archive controller.
 
